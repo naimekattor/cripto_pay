@@ -1,0 +1,72 @@
+{
+	"info": {
+		"name": "Crypto Gift Cards",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Public - List Cards",
+			"request": {
+				"method": "GET",
+				"url": "http://localhost:3000/cards"
+			}
+		},
+		{
+			"name": "Public - Create Buy Intent",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"card_id\": 1\n}"
+				},
+				"url": "http://localhost:3000/buy"
+			}
+		},
+		{
+			"name": "Public - Download File",
+			"request": {
+				"method": "GET",
+				"url": "http://localhost:3000/download/0x_YOUR_TX_HASH_HERE"
+			}
+		},
+		{
+			"name": "Admin - Add Card",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "x-admin-key",
+						"value": "your_api_key_here"
+					}
+				],
+				"body": {
+					"mode": "formdata",
+					"formdata": [
+						{
+							"key": "name",
+							"value": "New Card",
+							"type": "text"
+						},
+						{
+							"key": "price",
+							"value": "0.01",
+							"type": "text"
+						},
+						{
+							"key": "file",
+							"type": "file",
+							"src": ""
+						}
+					]
+				},
+				"url": "http://localhost:3000/admin/add-card"
+			}
+		}
+	]
+}
