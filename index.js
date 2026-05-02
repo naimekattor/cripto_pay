@@ -6,6 +6,7 @@ const fs = require("fs");
 const path = require("path");
 const { Sequelize, DataTypes, Op } = require("sequelize");
 const { ethers } = require("ethers");
+const cors = require("cors");
 require("dotenv").config();
 
 const app = express();
@@ -38,6 +39,8 @@ const ADMIN_SESSION_SECRET =
 const HOLD_HOURS = 24;
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+app.use(cors());
 
 // ---------------------------------------------------------
 // Middleware (Conditional Body Parsing)
@@ -74,12 +77,18 @@ const Card = sequelize.define(
     name: { type: DataTypes.STRING, allowNull: false },
     description: { type: DataTypes.TEXT },
     price: { type: DataTypes.FLOAT, allowNull: false },
-    file_path: { type: DataTypes.STRING, allowNull: false },
+    file_path: { type: DataTypes.STRING, allowNull: true },
     status: {
       type: DataTypes.STRING,
       defaultValue: "active",
       validate: { isIn: [["active", "sold"]] },
     },
+    retailer_wallet_address: { type: DataTypes.STRING }, // Renamed from seller_wallet_address for consistency? No, let's keep seller_wallet_address
+    seller_wallet_address: { type: DataTypes.STRING },
+    card_code: { type: DataTypes.STRING },
+    card_pin: { type: DataTypes.STRING },
+    retailer: { type: DataTypes.STRING },
+    denomination: { type: DataTypes.FLOAT },
   },
   { tableName: "cards", timestamps: false }
 );
@@ -251,12 +260,43 @@ app.post("/admin/add-card", requireAdmin, upload.single("file"), async (req, res
   }
 });
 
+// Public - Sell Card (Anonymous)
+app.post("/cards/sell", upload.single("file"), async (req, res) => {
+  try {
+    const { retailer, value, price, card_code, card_pin, seller_wallet_address } = req.body;
+    const amount = parseAmount(price);
+    const faceValue = parseAmount(value);
+
+    if (!retailer || !amount || !faceValue || !card_code || !seller_wallet_address) {
+      if (req.file?.path) fs.unlink(req.file.path, () => undefined);
+      return res.status(400).json({ error: "retailer, price, value, card_code and seller_wallet_address are required." });
+    }
+
+    const card = await Card.create({
+      name: `${retailer} - £${value}`,
+      description: `Gift card for ${retailer}`,
+      price: amount,
+      denomination: faceValue,
+      file_path: req.file ? req.file.path : "",
+      status: "active",
+      retailer,
+      card_code,
+      card_pin,
+      seller_wallet_address,
+    });
+
+    return res.status(201).json({ message: "Card listed successfully.", card_id: card.id });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 // Public - Get Active Cards
 app.get("/cards", async (_req, res) => {
   try {
     const cards = await Card.findAll({
       where: { status: "active" },
-      attributes: ["id", "name", "description", "price", "status"],
+      attributes: ["id", "name", "description", "price", "status", "retailer", "denomination"],
       order: [["id", "DESC"]],
     });
     return res.json(cards);
@@ -439,7 +479,9 @@ async function setupAdminPanel() {
         resource: Card,
         options: {
           navigation: { name: "Catalog", icon: "Product" },
-          listProperties: ["id", "name", "price", "status"],
+          listProperties: ["id", "name", "price", "status", "retailer", "seller_wallet_address"],
+          showProperties: ["id", "name", "description", "price", "status", "retailer", "seller_wallet_address", "card_code", "card_pin", "file_path"],
+          editProperties: ["name", "description", "price", "status", "retailer", "seller_wallet_address", "card_code", "card_pin"],
         },
       },
       {
@@ -521,8 +563,16 @@ cron.schedule("0 * * * *", async () => {
 
     for (const payment of duePayments) {
       try {
+        const card = await Card.findByPk(payment.card_id);
+        const payoutAddress = (card && card.seller_wallet_address) ? card.seller_wallet_address : MAIN_BUSINESS_ACCOUNT;
+        
+        if (!payoutAddress) {
+          console.error(`No payout address for payment ${payment.id}`);
+          continue;
+        }
+
         await transferFunds({
-          to: MAIN_BUSINESS_ACCOUNT,
+          to: payoutAddress,
           amount: payment.amount,
           asset: normalizeAsset(payment.asset, ""),
           decimals: payment.asset_decimals,

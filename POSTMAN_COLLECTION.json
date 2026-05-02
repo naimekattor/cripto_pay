@@ -8,7 +8,7 @@
 			"name": "Public - List Cards",
 			"request": {
 				"method": "GET",
-				"url": "http://localhost:3000/cards"
+				"url": "http://localhost:4000/cards"
 			}
 		},
 		{
@@ -25,14 +25,14 @@
 					"mode": "raw",
 					"raw": "{\n    \"card_id\": 1\n}"
 				},
-				"url": "http://localhost:3000/buy"
+				"url": "http://localhost:4000/buy"
 			}
 		},
 		{
 			"name": "Public - Download File",
 			"request": {
 				"method": "GET",
-				"url": "http://localhost:3000/download/0x_YOUR_TX_HASH_HERE"
+				"url": "http://localhost:4000/download/0x_YOUR_TX_HASH_HERE"
 			}
 		},
 		{
@@ -65,7 +65,7 @@
 						}
 					]
 				},
-				"url": "http://localhost:3000/admin/add-card"
+				"url": "http://localhost:4000/admin/add-card"
 			}
 		}
 	]
