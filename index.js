@@ -7,6 +7,9 @@ const path = require("path");
 const { Sequelize, DataTypes, Op } = require("sequelize");
 const { ethers } = require("ethers");
 const cors = require("cors");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const axios = require("axios");
 require("dotenv").config();
 
 const app = express();
@@ -16,6 +19,7 @@ const PORT = Number(process.env.PORT || 3000);
 
 const DB_PATH = path.join(__dirname, "payments.db");
 const UPLOAD_DIR = path.join(__dirname, "uploads");
+const JWT_SECRET = process.env.JWT_SECRET || "your-very-secure-jwt-secret-key-here";
 
 // ---------------------------------------------------------
 // Configuration & Providers
@@ -70,6 +74,18 @@ const sequelize = new Sequelize({
   logging: false,
 });
 
+const User = sequelize.define(
+  "User",
+  {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    email: { type: DataTypes.STRING, unique: true, allowNull: false },
+    password_hash: { type: DataTypes.STRING, allowNull: false },
+    role: { type: DataTypes.STRING, validate: { isIn: [["buyer", "seller", "admin"]] }, defaultValue: "buyer" },
+    created_at: { type: DataTypes.DATE, defaultValue: Sequelize.NOW },
+  },
+  { tableName: "users", timestamps: false }
+);
+
 const Card = sequelize.define(
   "Card",
   {
@@ -81,14 +97,17 @@ const Card = sequelize.define(
     status: {
       type: DataTypes.STRING,
       defaultValue: "active",
-      validate: { isIn: [["active", "sold"]] },
+      validate: { isIn: [["active", "sold", "cancelled"]] },
     },
-    retailer_wallet_address: { type: DataTypes.STRING }, // Renamed from seller_wallet_address for consistency? No, let's keep seller_wallet_address
+    retailer_wallet_address: { type: DataTypes.STRING },
     seller_wallet_address: { type: DataTypes.STRING },
     card_code: { type: DataTypes.STRING },
     card_pin: { type: DataTypes.STRING },
     retailer: { type: DataTypes.STRING },
     denomination: { type: DataTypes.FLOAT },
+    region: { type: DataTypes.STRING, defaultValue: "USA" },
+    currency: { type: DataTypes.STRING, defaultValue: "USD" },
+    seller_id: { type: DataTypes.INTEGER },
   },
   { tableName: "cards", timestamps: false }
 );
@@ -106,15 +125,19 @@ const Payment = sequelize.define(
       validate: { isIn: [["pending", "holding", "completed", "returned"]] },
     },
     card_id: { type: DataTypes.INTEGER },
+    buyer_id: { type: DataTypes.INTEGER },
     release_at: { type: DataTypes.DATE },
     asset: { type: DataTypes.STRING, defaultValue: "ETH" },
     asset_decimals: { type: DataTypes.INTEGER, defaultValue: 18 },
+    complaint_status: { type: DataTypes.STRING, defaultValue: "none", validate: { isIn: [["none", "complained", "valid"]] } },
     created_at: { type: DataTypes.DATE, defaultValue: Sequelize.NOW },
   },
   { tableName: "payments", timestamps: false }
 );
 
+Card.belongsTo(User, { foreignKey: "seller_id", as: "seller" });
 Payment.belongsTo(Card, { foreignKey: "card_id", as: "card" });
+Payment.belongsTo(User, { foreignKey: "buyer_id", as: "buyer" });
 
 // ---------------------------------------------------------
 // Helpers
@@ -231,9 +254,171 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
+function authenticateJWT(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (authHeader) {
+    const token = authHeader.split(' ')[1];
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+      if (err) return res.status(403).json({ error: "Invalid token" });
+      req.user = user;
+      next();
+    });
+  } else {
+    return res.status(401).json({ error: "Authentication token required" });
+  }
+}
+
 // ---------------------------------------------------------
 // API Routes
 // ---------------------------------------------------------
+
+// ---------------------------------------------------------
+// Auth Routes
+// ---------------------------------------------------------
+app.post("/auth/register", async (req, res) => {
+  try {
+    const { email, password, role } = req.body;
+    if (!email || !password || !role) {
+      return res.status(400).json({ error: "Email, password, and role are required." });
+    }
+    const existing = await User.findOne({ where: { email } });
+    if (existing) {
+      return res.status(409).json({ error: "Email already in use." });
+    }
+    const password_hash = await bcrypt.hash(password, 10);
+    const user = await User.create({ email, password_hash, role });
+    res.status(201).json({ message: "User registered successfully.", id: user.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ where: { email } });
+    if (!user) return res.status(401).json({ error: "Invalid credentials" });
+
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) return res.status(401).json({ error: "Invalid credentials" });
+
+    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
+    res.json({ token, role: user.role, email: user.email });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ---------------------------------------------------------
+// Buyer Dashboard Routes
+// ---------------------------------------------------------
+app.get("/buyer/payments", authenticateJWT, async (req, res) => {
+  if (req.user.role !== "buyer") return res.status(403).json({ error: "Access denied" });
+  try {
+    const payments = await Payment.findAll({
+      where: { buyer_id: req.user.id },
+      include: [{ model: Card, as: "card" }],
+      order: [["id", "DESC"]],
+    });
+    res.json(payments);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/buyer/payments/:id/complain", authenticateJWT, async (req, res) => {
+  if (req.user.role !== "buyer") return res.status(403).json({ error: "Access denied" });
+  try {
+    const payment = await Payment.findOne({ where: { id: req.params.id, buyer_id: req.user.id } });
+    if (!payment) return res.status(404).json({ error: "Payment not found" });
+    if (!["holding", "completed"].includes(payment.status)) {
+      return res.status(400).json({ error: "Cannot complain about a payment in this status." });
+    }
+    if (payment.complaint_status !== "none") {
+      return res.status(400).json({ error: "Complaint already filed or payment confirmed." });
+    }
+
+    // Auto refund
+    const { refundTxHash } = await refundPaymentByLookup({ paymentId: payment.id });
+    
+    payment.complaint_status = "complained";
+    // Refund sets payment status to 'returned'
+    await payment.save();
+
+    res.json({ message: "Complaint filed and funds returned.", refund_tx_hash: refundTxHash });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/buyer/payments/:id/confirm", authenticateJWT, async (req, res) => {
+  if (req.user.role !== "buyer") return res.status(403).json({ error: "Access denied" });
+  try {
+    const payment = await Payment.findOne({ where: { id: req.params.id, buyer_id: req.user.id } });
+    if (!payment) return res.status(404).json({ error: "Payment not found" });
+    if (payment.complaint_status !== "none") {
+      return res.status(400).json({ error: "Already confirmed or complained." });
+    }
+    
+    payment.complaint_status = "valid";
+    await payment.save();
+
+    res.json({ message: "Card confirmed as valid." });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ---------------------------------------------------------
+// Seller Dashboard Routes
+// ---------------------------------------------------------
+app.get("/seller/cards", authenticateJWT, async (req, res) => {
+  if (req.user.role !== "seller") return res.status(403).json({ error: "Access denied" });
+  try {
+    const cards = await Card.findAll({
+      where: { seller_id: req.user.id },
+      order: [["id", "DESC"]],
+    });
+    res.json(cards);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/seller/cards/:id/cancel", authenticateJWT, async (req, res) => {
+  if (req.user.role !== "seller") return res.status(403).json({ error: "Access denied" });
+  try {
+    const card = await Card.findOne({ where: { id: req.params.id, seller_id: req.user.id } });
+    if (!card) return res.status(404).json({ error: "Card not found" });
+    if (card.status !== "active") return res.status(400).json({ error: "Only active cards can be cancelled." });
+
+    const existingPayment = await Payment.findOne({
+      where: { card_id: card.id, status: { [Op.in]: ["pending", "holding"] } },
+    });
+    if (existingPayment) {
+      return res.status(400).json({ error: "Cannot cancel card with a pending or holding payment." });
+    }
+
+    card.status = "cancelled";
+    await card.save();
+
+    res.json({ message: "Card cancelled successfully." });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ---------------------------------------------------------
+// Exchange Rates API
+// ---------------------------------------------------------
+app.get("/exchange-rates", async (req, res) => {
+  try {
+    const response = await axios.get("https://open.er-api.com/v6/latest/USD");
+    res.json(response.data.rates);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch exchange rates." });
+  }
+});
 
 // Admin - Add Card (Manual API)
 app.post("/admin/add-card", requireAdmin, upload.single("file"), async (req, res) => {
@@ -260,10 +445,11 @@ app.post("/admin/add-card", requireAdmin, upload.single("file"), async (req, res
   }
 });
 
-// Public - Sell Card (Anonymous)
-app.post("/cards/sell", upload.single("file"), async (req, res) => {
+// Public - Sell Card
+app.post("/cards/sell", authenticateJWT, upload.single("file"), async (req, res) => {
   try {
-    const { retailer, value, price, card_code, card_pin, seller_wallet_address } = req.body;
+    if (req.user.role !== "seller") return res.status(403).json({ error: "Access denied" });
+    const { retailer, value, price, card_code, card_pin, seller_wallet_address, region, currency } = req.body;
     const amount = parseAmount(price);
     const faceValue = parseAmount(value);
 
@@ -273,7 +459,7 @@ app.post("/cards/sell", upload.single("file"), async (req, res) => {
     }
 
     const card = await Card.create({
-      name: `${retailer} - £${value}`,
+      name: `${retailer} - ${currency === "GBP" ? "£" : "$"}${value}`,
       description: `Gift card for ${retailer}`,
       price: amount,
       denomination: faceValue,
@@ -283,6 +469,9 @@ app.post("/cards/sell", upload.single("file"), async (req, res) => {
       card_code,
       card_pin,
       seller_wallet_address,
+      region: region || "USA",
+      currency: currency || "USD",
+      seller_id: req.user.id,
     });
 
     return res.status(201).json({ message: "Card listed successfully.", card_id: card.id });
@@ -296,7 +485,7 @@ app.get("/cards", async (_req, res) => {
   try {
     const cards = await Card.findAll({
       where: { status: "active" },
-      attributes: ["id", "name", "description", "price", "status", "retailer", "denomination"],
+      attributes: ["id", "name", "description", "price", "status", "retailer", "denomination", "region", "currency"],
       order: [["id", "DESC"]],
     });
     return res.json(cards);
@@ -306,8 +495,9 @@ app.get("/cards", async (_req, res) => {
 });
 
 // Public - Buy Card
-app.post("/buy", async (req, res) => {
+app.post("/buy", authenticateJWT, async (req, res) => {
   try {
+    if (req.user.role !== "buyer") return res.status(403).json({ error: "Access denied" });
     const cardId = Number(req.body.card_id);
     const card = await Card.findByPk(cardId);
     if (!card || card.status !== "active") {
@@ -325,6 +515,7 @@ app.post("/buy", async (req, res) => {
       amount: card.price,
       status: "pending",
       card_id: card.id,
+      buyer_id: req.user.id,
       asset: "ETH",
       asset_decimals: 18,
     });
