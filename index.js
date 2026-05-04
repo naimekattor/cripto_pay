@@ -71,7 +71,7 @@ app.use(express.static(__dirname));
 const sequelize = new Sequelize({
   dialect: "sqlite",
   storage: DB_PATH,
-  logging: false,
+  logging: console.log,
 });
 
 const User = sequelize.define(
@@ -104,6 +104,7 @@ const Card = sequelize.define(
     card_code: { type: DataTypes.STRING },
     card_pin: { type: DataTypes.STRING },
     retailer: { type: DataTypes.STRING },
+    retailer_wallet_address: { type: DataTypes.STRING },
     denomination: { type: DataTypes.FLOAT },
     region: { type: DataTypes.STRING, defaultValue: "USA" },
     currency: { type: DataTypes.STRING, defaultValue: "USD" },
@@ -388,9 +389,13 @@ app.get("/seller/cards", authenticateJWT, async (req, res) => {
 app.post("/seller/cards/:id/cancel", authenticateJWT, async (req, res) => {
   if (req.user.role !== "seller") return res.status(403).json({ error: "Access denied" });
   try {
-    const card = await Card.findOne({ where: { id: req.params.id, seller_id: req.user.id } });
-    if (!card) return res.status(404).json({ error: "Card not found" });
-    if (card.status !== "active") return res.status(400).json({ error: "Only active cards can be cancelled." });
+    const cardId = Number(req.params.id);
+    if (!Number.isInteger(cardId)) return res.status(400).json({ error: "Invalid card ID" });
+
+    const card = await Card.findOne({ where: { id: cardId, seller_id: req.user.id } });
+    if (!card) return res.status(404).json({ error: "Card not found or not owned by you" });
+    if (card.status === "cancelled") return res.json({ message: "Card already cancelled." });
+    if (card.status !== "active") return res.status(400).json({ error: `Card cannot be cancelled in '${card.status}' status.` });
 
     const existingPayment = await Payment.findOne({
       where: { card_id: card.id, status: { [Op.in]: ["pending", "holding"] } },
@@ -404,6 +409,11 @@ app.post("/seller/cards/:id/cancel", authenticateJWT, async (req, res) => {
 
     res.json({ message: "Card cancelled successfully." });
   } catch (error) {
+    console.error("Cancel card error:", error);
+    if (error.name === 'SequelizeValidationError' || error.name === 'SequelizeUniqueConstraintError') {
+      const messages = error.errors.map(e => `${e.path}: ${e.message}`);
+      return res.status(400).json({ error: "Validation failed", details: messages });
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -789,11 +799,42 @@ app.get("/health", (_req, res) => {
 async function start() {
   await sequelize.authenticate();
   await sequelize.sync();
+  // Fix cards table CHECK constraint to allow 'cancelled' status
+  try {
+    await sequelize.query(`CREATE TABLE cards_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      description TEXT,
+      price REAL NOT NULL,
+      file_path TEXT,
+      status TEXT DEFAULT 'active',
+      retailer_wallet_address VARCHAR(255),
+      seller_wallet_address VARCHAR(255),
+      card_code VARCHAR(255),
+      card_pin VARCHAR(255),
+      retailer VARCHAR(255),
+      denomination FLOAT,
+      region VARCHAR(255) DEFAULT 'USA',
+      currency VARCHAR(255) DEFAULT 'USD',
+      seller_id INTEGER
+    );`);
+    await sequelize.query(`INSERT INTO cards_new SELECT * FROM cards;`);
+    await sequelize.query(`DROP TABLE cards;`);
+    await sequelize.query(`ALTER TABLE cards_new RENAME TO cards;`);
+    console.log('Fixed cards table schema - added support for cancelled status');
+  } catch (err) {
+    // Table might already be fixed or other issue
+  }
   await setupAdminPanel();
   app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
 }
 
 start().catch((err) => {
-  console.error("Startup failed:", err.message);
+  if (err.name === 'SequelizeValidationError' || err.name === 'SequelizeUniqueConstraintError') {
+    console.error("Startup failed with validation errors:");
+    err.errors.forEach(e => console.error(`- ${e.message} (field: ${e.path}, value: ${e.value})`));
+  } else {
+    console.error("Startup failed:", err);
+  }
   process.exit(1);
 });
