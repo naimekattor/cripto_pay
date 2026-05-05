@@ -15,7 +15,7 @@ require("dotenv").config();
 const app = express();
 app.set("trust proxy", 1); // Essential for session cookies behind proxies/tunnels
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = Number(process.env.PORT || 5000);
 
 const DB_PATH = path.join(__dirname, "payments.db");
 const UPLOAD_DIR = path.join(__dirname, "uploads");
@@ -24,9 +24,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "your-very-secure-jwt-secret-key-he
 // ---------------------------------------------------------
 // Configuration & Providers
 // ---------------------------------------------------------
-const providerUrl =
-  process.env.RPC_URL ||
-  `https://eth-sepolia.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY || ""}`;
+const providerUrl = process.env.RPC_URL || `https://eth-sepolia.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY || ""}`;
 const provider = new ethers.JsonRpcProvider(providerUrl);
 const privateKey = process.env.METAMASK_PRIVATE_KEY;
 const wallet = privateKey ? new ethers.Wallet(privateKey, provider) : null;
@@ -92,12 +90,13 @@ const Card = sequelize.define(
     id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
     name: { type: DataTypes.STRING, allowNull: false },
     description: { type: DataTypes.TEXT },
-    price: { type: DataTypes.FLOAT, allowNull: false },
+    price: { type: DataTypes.FLOAT, allowNull: false }, // Final price shown to buyers (Admin defined)
+    seller_asking_price: { type: DataTypes.FLOAT, allowNull: false }, // What the seller wants to receive
     file_path: { type: DataTypes.STRING, allowNull: true },
     status: {
       type: DataTypes.STRING,
-      defaultValue: "active",
-      validate: { isIn: [["active", "sold", "cancelled"]] },
+      defaultValue: "pending_approval",
+      validate: { isIn: [["pending_approval", "active", "sold", "cancelled", "rejected"]] },
     },
     retailer_wallet_address: { type: DataTypes.STRING },
     seller_wallet_address: { type: DataTypes.STRING },
@@ -248,11 +247,15 @@ const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
 // ---------------------------------------------------------
 function requireAdmin(req, res, next) {
   if (!ADMIN_API_KEY) return next();
-  const key = req.header("x-admin-key") || req.query.admin_key || req.body.admin_key || "";
-  if (key !== ADMIN_API_KEY) {
-    return res.status(401).json({ error: "Unauthorized admin request." });
+  const authHeader = req.headers.authorization;
+  if (authHeader) {
+    const token = authHeader.split(' ')[1];
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      if (decoded.role === 'admin') return next();
+    } catch (e) {}
   }
-  return next();
+  return res.status(401).json({ error: "Unauthorized admin request." });
 }
 
 function authenticateJWT(req, res, next) {
@@ -373,6 +376,55 @@ app.post("/buyer/payments/:id/confirm", authenticateJWT, async (req, res) => {
 // ---------------------------------------------------------
 // Seller Dashboard Routes
 // ---------------------------------------------------------
+// ---------------------------------------------------------
+// Admin API Routes for Card Approval/Rejection
+// ---------------------------------------------------------
+// POST /admin/cards/:id/approve - REST endpoint (kept for backward compatibility)
+app.post("/admin/cards/:id/approve", requireAdmin, async (req, res) => {
+  try {
+    // Prevent caching
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.set("ETag", undefined);
+
+    const card = await Card.findByPk(req.params.id);
+    if (!card) return res.status(404).json({ error: "Card not found" });
+    if (card.status !== "pending_approval") {
+      return res.status(400).json({ error: "Card is not pending approval" });
+    }
+    card.status = "active";
+    await card.save();
+
+    console.log(`[ADMIN] Card #${card.id} approved by admin`);
+    res.json({ message: "Card approved and now active", card });
+  } catch (error) {
+    console.error("[ERROR] Approve card failed:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/admin/cards/:id/reject", requireAdmin, async (req, res) => {
+  try {
+    // Prevent caching
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.set("ETag", undefined);
+
+    const card = await Card.findByPk(req.params.id);
+    if (!card) return res.status(404).json({ error: "Card not found" });
+    if (card.status !== "pending_approval") {
+      return res.status(400).json({ error: "Card is not pending approval" });
+    }
+    card.status = "rejected";
+    await card.save();
+    res.json({ message: "Card rejected", card });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/seller/cards", authenticateJWT, async (req, res) => {
   if (req.user.role !== "seller") return res.status(403).json({ error: "Access denied" });
   try {
@@ -387,34 +439,73 @@ app.get("/seller/cards", authenticateJWT, async (req, res) => {
 });
 
 app.post("/seller/cards/:id/cancel", authenticateJWT, async (req, res) => {
-  if (req.user.role !== "seller") return res.status(403).json({ error: "Access denied" });
+  const cardIdRaw = req.params.id;
+  const userIdRaw = req.user?.id;
+  
+  console.log(`[Cancel Request] Card ID: ${cardIdRaw}, User ID: ${userIdRaw}, Role: ${req.user?.role}`);
+
+  if (req.user?.role !== "seller") {
+    return res.status(403).json({ error: "Access denied. Only sellers can cancel listings." });
+  }
+
   try {
-    const cardId = Number(req.params.id);
-    if (!Number.isInteger(cardId)) return res.status(400).json({ error: "Invalid card ID" });
+    const cardId = Number(cardIdRaw);
+    if (isNaN(cardId)) {
+      return res.status(400).json({ error: `Invalid card ID: ${cardIdRaw}` });
+    }
 
-    const card = await Card.findOne({ where: { id: cardId, seller_id: req.user.id } });
-    if (!card) return res.status(404).json({ error: "Card not found or not owned by you" });
-    if (card.status === "cancelled") return res.json({ message: "Card already cancelled." });
-    if (card.status !== "active") return res.status(400).json({ error: `Card cannot be cancelled in '${card.status}' status.` });
+    const sellerId = Number(userIdRaw);
+    if (isNaN(sellerId)) {
+      return res.status(400).json({ error: "Invalid user authentication data." });
+    }
 
+    // Find card by ID
+    const card = await Card.findByPk(cardId);
+    if (!card) {
+      return res.status(404).json({ error: `Card #${cardId} not found.` });
+    }
+
+    // Verify ownership
+    if (Number(card.seller_id) !== sellerId) {
+      console.log(`[Cancel Error] Ownership mismatch. Card #${cardId} owned by ${card.seller_id}, requested by ${sellerId}`);
+      return res.status(403).json({ error: "Permission denied. You are not the owner of this card." });
+    }
+
+    // Idempotent check
+    if (card.status === "cancelled") {
+      return res.json({ message: "Card is already cancelled." });
+    }
+    
+    // Status check
+    if (card.status !== "active") {
+      console.log(`[Cancel Error] Card #${cardId} is '${card.status}'`);
+      return res.status(400).json({ error: `Cannot cancel this card because it is already '${card.status}'.` });
+    }
+
+    // Escrow check
     const existingPayment = await Payment.findOne({
       where: { card_id: card.id, status: { [Op.in]: ["pending", "holding"] } },
     });
+
     if (existingPayment) {
-      return res.status(400).json({ error: "Cannot cancel card with a pending or holding payment." });
+      console.log(`[Cancel Error] Card #${cardId} has active payment #${existingPayment.id} (Status: ${existingPayment.status})`);
+      return res.status(400).json({ error: `Cannot cancel card while a buyer is processing a payment (Escrow status: ${existingPayment.status}).` });
     }
 
+    // Execute cancellation
     card.status = "cancelled";
     await card.save();
 
-    res.json({ message: "Card cancelled successfully." });
+    console.log(`[Cancel Success] Card #${cardId} cancelled by seller ${sellerId}`);
+    res.json({ message: "Card listing cancelled successfully." });
+
   } catch (error) {
-    console.error("Cancel card error:", error);
-    if (error.name === 'SequelizeValidationError' || error.name === 'SequelizeUniqueConstraintError') {
-      const messages = error.errors.map(e => `${e.path}: ${e.message}`);
-      return res.status(400).json({ error: "Validation failed", details: messages });
-    }
-    res.status(500).json({ error: error.message });
+    console.error("[Cancel Exception]:", error);
+    res.status(500).json({ 
+      error: "An internal error occurred while cancelling the card.", 
+      message: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -423,9 +514,17 @@ app.post("/seller/cards/:id/cancel", authenticateJWT, async (req, res) => {
 // ---------------------------------------------------------
 app.get("/exchange-rates", async (req, res) => {
   try {
-    const response = await axios.get("https://open.er-api.com/v6/latest/USD");
-    res.json(response.data.rates);
+    const [fiatRes, cryptoRes] = await Promise.all([
+      axios.get("https://open.er-api.com/v6/latest/USD"),
+      axios.get("https://min-api.cryptocompare.com/data/price?fsym=ETH&tsyms=USD")
+    ]);
+    
+    res.json({
+      ...fiatRes.data.rates,
+      ETH: cryptoRes.data.USD // Price of 1 ETH in USD
+    });
   } catch (error) {
+    console.error("Exchange rate fetch error:", error);
     res.status(500).json({ error: "Failed to fetch exchange rates." });
   }
 });
@@ -471,10 +570,11 @@ app.post("/cards/sell", authenticateJWT, upload.single("file"), async (req, res)
     const card = await Card.create({
       name: `${retailer} - ${currency === "GBP" ? "£" : "$"}${value}`,
       description: `Gift card for ${retailer}`,
-      price: amount,
+      price: amount, // Initially same as asking price, Admin will edit this for margin
+      seller_asking_price: amount,
       denomination: faceValue,
       file_path: req.file ? req.file.path : "",
-      status: "active",
+      status: "pending_approval",
       retailer,
       card_code,
       card_pin,
@@ -528,6 +628,7 @@ app.post("/buy", authenticateJWT, async (req, res) => {
       buyer_id: req.user.id,
       asset: "ETH",
       asset_decimals: 18,
+      user_address: req.body.wallet_address || null
     });
 
     return res.status(201).json({
@@ -582,8 +683,21 @@ app.post("/alchemy-webhook", async (req, res) => {
         continue;
       }
 
+      // 0.5% tolerance for crypto payments to handle minor rounding differences
+      const tolerance = 0.005;
+      const minAmount = amount * (1 - tolerance);
+      const maxAmount = amount * (1 + tolerance);
+
       const pendingPayments = await Payment.findAll({
-        where: { status: "pending", amount: amount, asset: asset },
+        where: { 
+          status: "pending", 
+          amount: { [Op.between]: [minAmount, maxAmount] },
+          asset: asset,
+          [Op.or]: [
+            { user_address: fromAddress },
+            { user_address: null }
+          ]
+        },
         include: [{ model: Card, as: "card", where: { status: "active" } }],
         order: [["id", "ASC"]],
       });
@@ -677,19 +791,175 @@ async function setupAdminPanel() {
     branding: { companyName: "Gift Card Admin" },
     resources: [
       {
+        resource: User,
+        options: {
+          navigation: { name: "Identity", icon: "User" },
+          listProperties: ["id", "email", "role"],
+          editProperties: ["email", "role", "password"],
+        },
+      },
+      {
         resource: Card,
         options: {
           navigation: { name: "Catalog", icon: "Product" },
-          listProperties: ["id", "name", "price", "status", "retailer", "seller_wallet_address"],
-          showProperties: ["id", "name", "description", "price", "status", "retailer", "seller_wallet_address", "card_code", "card_pin", "file_path"],
-          editProperties: ["name", "description", "price", "status", "retailer", "seller_wallet_address", "card_code", "card_pin"],
+          listProperties: ["id", "name", "price", "status", "retailer", "seller_id"],
+          showProperties: ["id", "name", "description", "price", "status", "retailer", "seller_id", "card_code", "card_pin", "file_path"],
+          editProperties: ["name", "description", "price", "status", "retailer", "card_code", "card_pin"],
+          actions: {
+            approve: {
+              actionType: "record",
+              component: false,
+              icon: "Checkmark",
+              guard: "Are you sure you want to approve this card and make it active?",
+              isVisible: ({ record }) => record.params.status === "pending_approval",
+              handler: async (request, response, context) => {
+                const { record, currentAdmin } = context;
+
+                // Prevent caching issues (304 Not Modified)
+                response.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+                response.set("Pragma", "no-cache");
+                response.set("Expires", "0");
+                response.set("ETag", undefined);
+
+                // GET request: Return current record state only (no action execution)
+                if (request.method.toLowerCase() === "get") {
+                  console.log(`[AdminJS] GET approve - Card #${record.params.id} (fetch only)`);
+                  return {
+                    record: record.toJSON(currentAdmin),
+                  };
+                }
+
+                // POST request: Execute the approval action
+                if (request.method.toLowerCase() !== "post") {
+                  return {
+                    record: record.toJSON(currentAdmin),
+                    notice: {
+                      message: `Invalid method: ${request.method}. Use POST.`,
+                      type: "error",
+                    },
+                  };
+                }
+
+                try {
+                  console.log(`[AdminJS] POST approve - Approving Card #${record.params.id}`);
+
+                  // Verify card exists and is in pending state
+                  const card = await Card.findByPk(record.params.id);
+                  if (!card) {
+                    return {
+                      record: record.toJSON(currentAdmin),
+                      notice: {
+                        message: "Card not found",
+                        type: "error",
+                      },
+                    };
+                  }
+
+                  if (card.status !== "pending_approval") {
+                    return {
+                      record: record.toJSON(currentAdmin),
+                      notice: {
+                        message: `Cannot approve: card is ${card.status}, not pending_approval`,
+                        type: "error",
+                      },
+                    };
+                  }
+
+                  // Update status
+                  card.status = "active";
+                  await card.save();
+
+                  console.log(`[AdminJS] ✓ Card #${card.id} approved successfully`);
+
+                  return {
+                    record: card.toJSON(currentAdmin),
+                    notice: {
+                      message: "Card approved and now active!",
+                      type: "success",
+                    },
+                    redirectUrl: "/admin/resources/Card",
+                  };
+                } catch (error) {
+                  console.error(`[AdminJS] ✗ Approve failed for Card #${record.params.id}:`, error);
+                  return {
+                    record: record.toJSON(currentAdmin),
+                    notice: {
+                      message: `Approval failed: ${error.message}`,
+                      type: "error",
+                    },
+                  };
+                }
+              },
+            },
+            reject: {
+              actionType: "record",
+              component: false,
+              icon: "Close",
+              guard: "Reject this card listing?",
+              isVisible: ({ record }) => record.params.status === "pending_approval",
+              handler: async (request, response, context) => {
+                const { record, currentAdmin } = context;
+
+                // Prevent caching issues (304 Not Modified)
+                response.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+                response.set("Pragma", "no-cache");
+                response.set("Expires", "0");
+                response.set("ETag", undefined);
+
+                // GET request: Return current record state only (no action execution)
+                if (request.method.toLowerCase() === "get") {
+                  console.log(`[AdminJS] GET reject - Card #${record.params.id} (fetch only)`);
+                  return {
+                    record: record.toJSON(currentAdmin),
+                  };
+                }
+
+                // POST request: Execute the reject action
+                if (request.method.toLowerCase() !== "post") {
+                  return {
+                    record: record.toJSON(currentAdmin),
+                    notice: {
+                      message: `Invalid method: ${request.method}. Use POST.`,
+                      type: "error",
+                    },
+                  };
+                }
+
+                try {
+                  console.log(`[AdminJS] POST reject - Rejecting Card #${record.params.id}`);
+
+                  await record.update({ status: "rejected" });
+
+                  console.log(`[AdminJS] ✓ Card #${record.params.id} rejected successfully`);
+
+                  return {
+                    record: record.toJSON(currentAdmin),
+                    notice: {
+                      message: "Card listing rejected.",
+                      type: "error",
+                    },
+                    redirectUrl: "/admin/resources/Card",
+                  };
+                } catch (error) {
+                  console.error(`[AdminJS] ✗ Reject failed for Card #${record.params.id}:`, error);
+                  return {
+                    record: record.toJSON(currentAdmin),
+                    notice: {
+                      message: `Rejection failed: ${error.message}`,
+                      type: "error",
+                    },
+                  };
+                }
+              },
+            },
+          },
         },
       },
       {
         resource: Payment,
         options: {
           navigation: { name: "Payments", icon: "Payment" },
-          listProperties: ["id", "external_id", "amount", "asset", "status", "card_id", "release_at"],
+          listProperties: ["id", "external_id", "amount", "asset", "status", "card_id", "buyer_id", "release_at"],
           actions: {
             new: { isAccessible: false },
             delete: { isAccessible: false },
@@ -767,6 +1037,9 @@ cron.schedule("0 * * * *", async () => {
         const card = await Card.findByPk(payment.card_id);
         const payoutAddress = (card && card.seller_wallet_address) ? card.seller_wallet_address : MAIN_BUSINESS_ACCOUNT;
         
+        // PROFIT LOGIC: Only send the seller's asking price. The remainder stays in the business wallet as profit.
+        const payoutAmount = (card && card.seller_asking_price) ? card.seller_asking_price : payment.amount;
+
         if (!payoutAddress) {
           console.error(`No payout address for payment ${payment.id}`);
           continue;
@@ -774,7 +1047,7 @@ cron.schedule("0 * * * *", async () => {
 
         await transferFunds({
           to: payoutAddress,
-          amount: payment.amount,
+          amount: payoutAmount,
           asset: normalizeAsset(payment.asset, ""),
           decimals: payment.asset_decimals,
         });
@@ -794,37 +1067,31 @@ app.get("/health", (_req, res) => {
 });
 
 // ---------------------------------------------------------
+// Middleware for AdminJS - Prevent Caching & 304 Errors
+// ---------------------------------------------------------
+app.use((req, res, next) => {
+  // Apply no-cache headers to all AdminJS routes
+  if (req.path.startsWith("/admin")) {
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.set("ETag", undefined);
+    
+    // Ensure responses won't return 304 Not Modified
+    if (req.method === "GET") {
+      res.set("Last-Modified", new Date().toUTCString());
+    }
+  }
+  next();
+});
+
+// ---------------------------------------------------------
 // Startup
 // ---------------------------------------------------------
 async function start() {
   await sequelize.authenticate();
   await sequelize.sync();
-  // Fix cards table CHECK constraint to allow 'cancelled' status
-  try {
-    await sequelize.query(`CREATE TABLE cards_new (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      description TEXT,
-      price REAL NOT NULL,
-      file_path TEXT,
-      status TEXT DEFAULT 'active',
-      retailer_wallet_address VARCHAR(255),
-      seller_wallet_address VARCHAR(255),
-      card_code VARCHAR(255),
-      card_pin VARCHAR(255),
-      retailer VARCHAR(255),
-      denomination FLOAT,
-      region VARCHAR(255) DEFAULT 'USA',
-      currency VARCHAR(255) DEFAULT 'USD',
-      seller_id INTEGER
-    );`);
-    await sequelize.query(`INSERT INTO cards_new SELECT * FROM cards;`);
-    await sequelize.query(`DROP TABLE cards;`);
-    await sequelize.query(`ALTER TABLE cards_new RENAME TO cards;`);
-    console.log('Fixed cards table schema - added support for cancelled status');
-  } catch (err) {
-    // Table might already be fixed or other issue
-  }
+  console.log('Database synced');
   await setupAdminPanel();
   app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
 }
