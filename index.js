@@ -144,14 +144,56 @@ const Payment = sequelize.define(
       defaultValue: "none",
       validate: { isIn: [["none", "complained", "valid"]] },
     },
+    // Admin Profit Tracking Fields
+    seller_payout_amount: { type: DataTypes.FLOAT },
+    admin_profit: { type: DataTypes.FLOAT },
+    payout_tx_hash: { type: DataTypes.STRING },
+    profit_locked_until: { type: DataTypes.DATE },
+    profit_status: {
+      type: DataTypes.STRING,
+      defaultValue: "none",
+      validate: { isIn: [["none", "holding", "released", "withdrawn"]] },
+    },
     created_at: { type: DataTypes.DATE, defaultValue: Sequelize.NOW },
   },
   { tableName: "payments", timestamps: false },
 );
 
+// Platform Profit Tracking Model
+const PlatformProfit = sequelize.define(
+  "PlatformProfit",
+  {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    payment_id: { type: DataTypes.INTEGER },
+    card_id: { type: DataTypes.INTEGER },
+    seller_id: { type: DataTypes.INTEGER },
+    buyer_id: { type: DataTypes.INTEGER },
+    total_amount: { type: DataTypes.FLOAT },
+    seller_payout: { type: DataTypes.FLOAT },
+    admin_profit: { type: DataTypes.FLOAT },
+    asset: { type: DataTypes.STRING, defaultValue: "ETH" },
+    asset_decimals: { type: DataTypes.INTEGER, defaultValue: 18 },
+    status: {
+      type: DataTypes.STRING,
+      defaultValue: "holding",
+      validate: { isIn: [["holding", "released", "withdrawn"]] },
+    },
+    locked_until: { type: DataTypes.DATE },
+    released_at: { type: DataTypes.DATE },
+    withdrawn_at: { type: DataTypes.DATE },
+    withdraw_tx_hash: { type: DataTypes.STRING },
+    created_at: { type: DataTypes.DATE, defaultValue: Sequelize.NOW },
+  },
+  { tableName: "platform_profits", timestamps: false },
+);
+
 Card.belongsTo(User, { foreignKey: "seller_id", as: "seller" });
 Payment.belongsTo(Card, { foreignKey: "card_id", as: "card" });
 Payment.belongsTo(User, { foreignKey: "buyer_id", as: "buyer" });
+PlatformProfit.belongsTo(Payment, { foreignKey: "payment_id", as: "payment" });
+PlatformProfit.belongsTo(Card, { foreignKey: "card_id", as: "card" });
+PlatformProfit.belongsTo(User, { foreignKey: "seller_id", as: "seller" });
+PlatformProfit.belongsTo(User, { foreignKey: "buyer_id", as: "buyer" });
 
 // ---------------------------------------------------------
 // Helpers
@@ -243,6 +285,90 @@ async function refundPaymentByLookup({ txHash, paymentId }) {
   }
 
   return { payment, refundTxHash };
+}
+
+async function settlePaymentToSeller({ paymentId }) {
+  if (!wallet) throw new Error("Wallet is not configured.");
+  if (!MAIN_BUSINESS_ACCOUNT)
+    throw new Error("MAIN_BUSINESS_ACCOUNT is not configured.");
+
+  const payment = await Payment.findByPk(paymentId);
+  if (!payment) throw new Error("Payment not found.");
+  if (payment.complaint_status === "complained") {
+    return {
+      payment,
+      didSettle: false,
+      reason: "Payment is under complaint review.",
+    };
+  }
+  if (payment.status !== "holding") {
+    return {
+      payment,
+      didSettle: false,
+      reason: `Payment status is '${payment.status}', not eligible for settlement.`,
+    };
+  }
+
+  // Idempotency guard: if we already have a payout hash, assume settled.
+  if (payment.payout_tx_hash) {
+    payment.status = "completed";
+    await payment.save();
+    return { payment, didSettle: false, reason: "Already settled." };
+  }
+
+  const card = payment.card_id ? await Card.findByPk(payment.card_id) : null;
+  const payoutAddress =
+    card && card.seller_wallet_address
+      ? card.seller_wallet_address
+      : MAIN_BUSINESS_ACCOUNT;
+
+  // PROFIT LOGIC: Only send the seller's asking price. The remainder stays in the business wallet as profit.
+  const sellerPayoutAmount =
+    card && card.seller_asking_price ? card.seller_asking_price : payment.amount;
+
+  const adminProfitAmount = payment.amount - sellerPayoutAmount;
+
+  if (!payoutAddress) throw new Error("No payout address configured.");
+
+  const payoutTxHash = await transferFunds({
+    to: payoutAddress,
+    amount: sellerPayoutAmount,
+    asset: normalizeAsset(payment.asset, ""),
+    decimals: payment.asset_decimals,
+  });
+
+  payment.seller_payout_amount = sellerPayoutAmount;
+  payment.admin_profit = adminProfitAmount;
+  payment.payout_tx_hash = payoutTxHash;
+  payment.profit_locked_until = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days lock
+  payment.profit_status = "holding";
+  payment.status = "completed";
+  await payment.save();
+
+  const existingProfit = await PlatformProfit.findOne({
+    where: { payment_id: payment.id },
+  });
+  if (!existingProfit) {
+    await PlatformProfit.create({
+      payment_id: payment.id,
+      card_id: card ? card.id : null,
+      seller_id: card ? card.seller_id : null,
+      buyer_id: payment.buyer_id,
+      total_amount: payment.amount,
+      seller_payout: sellerPayoutAmount,
+      admin_profit: adminProfitAmount,
+      asset: normalizeAsset(payment.asset, ""),
+      asset_decimals: payment.asset_decimals,
+      status: "holding",
+      locked_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    });
+  }
+
+  console.log(
+    `[SETTLEMENT] Payment #${payment.id}: Total ${payment.amount} | Seller: ${sellerPayoutAmount} | Admin: ${adminProfitAmount} | TX: ${payoutTxHash}`,
+  );
+
+  return { payment, didSettle: true, payoutTxHash };
 }
 
 // ---------------------------------------------------------
@@ -349,7 +475,17 @@ app.get("/buyer/payments", authenticateJWT, async (req, res) => {
       include: [{ model: Card, as: "card" }],
       order: [["id", "DESC"]],
     });
-    res.json(payments);
+    // Never leak card credentials for unpaid / refunded / pending flows.
+    const sanitized = payments.map((p) => {
+      const payment = p.toJSON();
+      const eligible = ["holding", "completed"].includes(payment.status);
+      if (!eligible && payment.card) {
+        delete payment.card.card_code;
+        delete payment.card.card_pin;
+      }
+      return payment;
+    });
+    res.json(sanitized);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -368,24 +504,24 @@ app.post("/buyer/payments/:id/complain", authenticateJWT, async (req, res) => {
         .status(400)
         .json({ error: "Cannot complain about a payment in this status." });
     }
-    if (payment.complaint_status !== "none") {
-      return res
-        .status(400)
-        .json({ error: "Complaint already filed or payment confirmed." });
+    if (payment.complaint_status === "valid") {
+      return res.status(400).json({
+        error: "Payment already confirmed as valid.",
+      });
     }
 
-    // Auto refund
-    const { refundTxHash } = await refundPaymentByLookup({
-      paymentId: payment.id,
-    });
+    if (payment.complaint_status === "complained") {
+      return res.json({ message: "Complaint already filed." });
+    }
 
+    // Complaint workflow: keep the payment in escrow ("holding").
+    // Admin can later resolve by confirming valid (release seller payout)
+    // or refunding the buyer.
     payment.complaint_status = "complained";
-    // Refund sets payment status to 'returned'
     await payment.save();
 
     res.json({
-      message: "Complaint filed and funds returned.",
-      refund_tx_hash: refundTxHash,
+      message: "Complaint filed. Seller payout is held for admin review.",
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -400,16 +536,43 @@ app.post("/buyer/payments/:id/confirm", authenticateJWT, async (req, res) => {
       where: { id: req.params.id, buyer_id: req.user.id },
     });
     if (!payment) return res.status(404).json({ error: "Payment not found" });
-    if (payment.complaint_status !== "none") {
-      return res
-        .status(400)
-        .json({ error: "Already confirmed or complained." });
+    if (!["holding", "completed"].includes(payment.status)) {
+      return res.status(400).json({
+        error: "Cannot confirm a payment in this status.",
+        status: payment.status,
+      });
     }
 
+    // Allow buyer confirmation even if they previously complained.
+    // This immediately releases seller payout (escrow settlement).
     payment.complaint_status = "valid";
     await payment.save();
 
-    res.json({ message: "Card confirmed as valid." });
+    // Instant settlement: release seller payout immediately upon buyer confirmation.
+    let settlement = null;
+    try {
+      if (payment.status === "holding") {
+        settlement = await settlePaymentToSeller({ paymentId: payment.id });
+      }
+    } catch (e) {
+      // If settlement fails (wallet misconfig / chain error), keep confirmation recorded
+      // but surface the error so the operator can retry.
+      return res.status(500).json({
+        error: "Card confirmed, but settlement failed.",
+        details: e.message,
+      });
+    }
+
+    return res.json({
+      message: "Card confirmed as valid.",
+      settlement: settlement
+        ? {
+            did_settle: Boolean(settlement.didSettle),
+            payout_tx_hash: settlement.payoutTxHash || null,
+            payment_status: settlement.payment?.status || payment.status,
+          }
+        : null,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -926,6 +1089,148 @@ app.post("/admin/refund", requireAdmin, async (req, res) => {
   }
 });
 
+// Admin - Platform Profit Analytics
+app.get("/admin/profit/summary", requireAdmin, async (req, res) => {
+  try {
+    const totalProfit = await PlatformProfit.sum("admin_profit") || 0;
+    const holdingProfit =
+      (await PlatformProfit.sum("admin_profit", {
+        where: { status: "holding" },
+      })) || 0;
+    const releasedProfit =
+      (await PlatformProfit.sum("admin_profit", {
+        where: { status: "released" },
+      })) || 0;
+    const withdrawnProfit =
+      (await PlatformProfit.sum("admin_profit", {
+        where: { status: "withdrawn" },
+      })) || 0;
+
+    const totalTransactions = await PlatformProfit.count();
+    const totalSellerPayouts = await PlatformProfit.sum("seller_payout") || 0;
+    const totalBuyerPayments =
+      await PlatformProfit.sum("total_amount") || 0;
+
+    res.json({
+      summary: {
+        total_profit: Number(totalProfit).toFixed(6),
+        total_seller_payouts: Number(totalSellerPayouts).toFixed(6),
+        total_buyer_payments: Number(totalBuyerPayments).toFixed(6),
+        total_transactions: totalTransactions,
+      },
+      profit_breakdown: {
+        holding: Number(holdingProfit).toFixed(6),
+        released: Number(releasedProfit).toFixed(6),
+        withdrawn: Number(withdrawnProfit).toFixed(6),
+      },
+      available_to_withdraw: Number(releasedProfit).toFixed(6),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin - Profit Details by Status
+app.get("/admin/profit/details", requireAdmin, async (req, res) => {
+  try {
+    const status = req.query.status || "holding"; // holding, released, withdrawn
+
+    const profits = await PlatformProfit.findAll({
+      where: { status },
+      include: [
+        { model: Card, as: "card", attributes: ["id", "name", "price"] },
+        {
+          model: User,
+          as: "seller",
+          attributes: ["id", "email", "role"],
+        },
+      ],
+      order: [["created_at", "DESC"]],
+    });
+
+    res.json({
+      status,
+      count: profits.length,
+      total_profit: Number(
+        profits.reduce((sum, p) => sum + (p.admin_profit || 0), 0),
+      ).toFixed(6),
+      records: profits,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin - Withdraw Profit
+app.post("/admin/profit/withdraw", requireAdmin, async (req, res) => {
+  try {
+    const { amount, address } = req.body;
+
+    if (!amount || !address) {
+      return res
+        .status(400)
+        .json({ error: "Amount and address required" });
+    }
+
+    // Get released profits available for withdrawal
+    const releasedProfit =
+      (await PlatformProfit.sum("admin_profit", {
+        where: { status: "released" },
+      })) || 0;
+
+    if (Number(amount) > releasedProfit) {
+      return res
+        .status(400)
+        .json({
+          error: "Insufficient released profit to withdraw",
+          available: Number(releasedProfit).toFixed(6),
+          requested: amount,
+        });
+    }
+
+    // Execute transfer
+    const withdrawTxHash = await transferFunds({
+      to: address,
+      amount: Number(amount),
+      asset: "ETH",
+      decimals: 18,
+    });
+
+    // Update profits as withdrawn (until we reach the requested amount)
+    let remainingAmount = Number(amount);
+    const profitsToWithdraw = await PlatformProfit.findAll({
+      where: { status: "released" },
+      order: [["created_at", "ASC"]],
+    });
+
+    for (const profit of profitsToWithdraw) {
+      if (remainingAmount <= 0) break;
+
+      const withdrawAmount = Math.min(remainingAmount, profit.admin_profit);
+      profit.status = "withdrawn";
+      profit.withdrawn_at = new Date();
+      profit.withdraw_tx_hash = withdrawTxHash;
+      await profit.save();
+
+      remainingAmount -= withdrawAmount;
+    }
+
+    console.log(
+      `[PROFIT] Withdrawn ${amount} ETH to ${address} (TX: ${withdrawTxHash})`,
+    );
+
+    res.json({
+      message: "Profit withdrawn successfully",
+      amount: amount,
+      tx_hash: withdrawTxHash,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("[ERROR] Profit withdrawal failed:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Public - Download Card
 app.get("/download/:tx_hash", async (req, res) => {
   try {
@@ -1114,22 +1419,88 @@ async function setupAdminPanel() {
             "id",
             "external_id",
             "amount",
+            "admin_profit",
+            "seller_payout_amount",
             "asset",
             "status",
+            "complaint_status",
+            "profit_status",
             "card_id",
             "buyer_id",
             "release_at",
           ],
+          properties: {
+            amount: { label: "Total Amount (ETH)" },
+            seller_payout_amount: { label: "Seller Payout (ETH)" },
+            admin_profit: { label: "Admin Profit (ETH)" },
+            asset: { label: "Asset" },
+            profit_status: { label: "Profit Status" },
+            profit_locked_until: { label: "Profit Locked Until" },
+            payout_tx_hash: { label: "Payout TX Hash" },
+          },
+          showProperties: [
+            "id",
+            "external_id",
+            "amount",
+            "seller_payout_amount",
+            "admin_profit",
+            "payout_tx_hash",
+            "asset",
+            "status",
+            "complaint_status",
+            "profit_status",
+            "profit_locked_until",
+            "card_id",
+            "buyer_id",
+            "release_at",
+            "created_at",
+          ],
           actions: {
             new: { isAccessible: false },
             delete: { isAccessible: false },
+            resolve_valid: {
+              actionType: "record",
+              component: false,
+              icon: "Checkmark",
+              guard: "Resolve complaint as valid and release seller payout?",
+              isVisible: ({ record }) =>
+                record.params.status === "holding" &&
+                record.params.complaint_status === "complained",
+              handler: async (request, _response, context) => {
+                const { record, currentAdmin } = context;
+                if (request.method !== "post")
+                  return { record: record.toJSON(currentAdmin) };
+                try {
+                  const payment = await Payment.findByPk(record.params.id);
+                  if (!payment) throw new Error("Payment not found.");
+                  payment.complaint_status = "valid";
+                  await payment.save();
+                  await settlePaymentToSeller({ paymentId: payment.id });
+
+                  const updated = await Payment.findByPk(payment.id);
+                  return {
+                    record: context.resource.build(updated).toJSON(currentAdmin),
+                    notice: {
+                      message: "Complaint resolved. Seller payout released.",
+                      type: "success",
+                    },
+                  };
+                } catch (err) {
+                  return {
+                    record: record.toJSON(currentAdmin),
+                    notice: { message: err.message, type: "error" },
+                  };
+                }
+              },
+            },
             refund: {
               actionType: "record",
               component: false,
               icon: "Undo",
               guard: "Refund this payment?",
               isVisible: ({ record }) =>
-                ["holding", "completed"].includes(record.params.status),
+                record.params.status === "holding" &&
+                record.params.complaint_status === "complained",
               handler: async (request, _response, context) => {
                 const { record, currentAdmin } = context;
                 if (request.method !== "post")
@@ -1153,6 +1524,51 @@ async function setupAdminPanel() {
               },
             },
           },
+        },
+      },
+      {
+        resource: PlatformProfit,
+        options: {
+          navigation: { name: "Profit Analytics", icon: "BarChart" },
+          listProperties: [
+            "id",
+            "payment_id",
+            "total_amount",
+            "seller_payout",
+            "admin_profit",
+            "asset",
+            "status",
+            "locked_until",
+            "created_at",
+          ],
+          properties: {
+            total_amount: { label: "Total Amount (ETH)" },
+            seller_payout: { label: "Seller Payout (ETH)" },
+            admin_profit: { label: "Admin Profit (ETH)" },
+            asset: { label: "Asset" },
+            status: { label: "Profit Status" },
+            locked_until: { label: "Locked Until" },
+            released_at: { label: "Released At" },
+            withdrawn_at: { label: "Withdrawn At" },
+          },
+          showProperties: [
+            "id",
+            "payment_id",
+            "card_id",
+            "seller_id",
+            "buyer_id",
+            "total_amount",
+            "seller_payout",
+            "admin_profit",
+            "asset",
+            "status",
+            "locked_until",
+            "released_at",
+            "withdrawn_at",
+            "withdraw_tx_hash",
+            "created_at",
+          ],
+          editProperties: ["status", "locked_until"],
         },
       },
     ],
@@ -1203,31 +1619,7 @@ cron.schedule("0 * * * *", async () => {
 
     for (const payment of duePayments) {
       try {
-        const card = await Card.findByPk(payment.card_id);
-        const payoutAddress =
-          card && card.seller_wallet_address
-            ? card.seller_wallet_address
-            : MAIN_BUSINESS_ACCOUNT;
-
-        // PROFIT LOGIC: Only send the seller's asking price. The remainder stays in the business wallet as profit.
-        const payoutAmount =
-          card && card.seller_asking_price
-            ? card.seller_asking_price
-            : payment.amount;
-
-        if (!payoutAddress) {
-          console.error(`No payout address for payment ${payment.id}`);
-          continue;
-        }
-
-        await transferFunds({
-          to: payoutAddress,
-          amount: payoutAmount,
-          asset: normalizeAsset(payment.asset, ""),
-          decimals: payment.asset_decimals,
-        });
-        payment.status = "completed";
-        await payment.save();
+        await settlePaymentToSeller({ paymentId: payment.id });
       } catch (err) {
         console.error(
           `Settlement failed for payment ${payment.id}:`,
