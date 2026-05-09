@@ -10,7 +10,7 @@ const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const axios = require("axios");
-require("dotenv").config();
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const app = express();
 app.set("trust proxy", 1); // Essential for session cookies behind proxies/tunnels
@@ -55,8 +55,14 @@ const jsonParser = express.json();
 const urlencodedParser = express.urlencoded({ extended: true });
 
 app.use((req, res, next) => {
-  // Skip body parsing for AdminJS routes as it uses its own parser (formidable)
-  if (req.originalUrl.startsWith("/admin")) {
+  // Skip body parsing only for AdminJS UI/API routes; keep custom /admin REST endpoints parsed.
+  const isAdminJsRoute =
+    req.originalUrl === "/admin" ||
+    req.originalUrl.startsWith("/admin/") &&
+      !req.originalUrl.startsWith("/admin/cards/") &&
+      !req.originalUrl.startsWith("/admin/refund") &&
+      !req.originalUrl.startsWith("/admin/profit/");
+  if (isAdminJsRoute) {
     return next();
   }
   jsonParser(req, res, (err) => {
@@ -132,7 +138,18 @@ const Payment = sequelize.define(
     status: {
       type: DataTypes.STRING,
       defaultValue: "pending",
-      validate: { isIn: [["pending", "holding", "completed", "returned"]] },
+      validate: {
+        isIn: [
+          [
+            "pending",
+            "holding",
+            "completed",
+            "returned",
+            "disputed",
+            "refunded",
+          ],
+        ],
+      },
     },
     card_id: { type: DataTypes.INTEGER },
     buyer_id: { type: DataTypes.INTEGER },
@@ -142,8 +159,20 @@ const Payment = sequelize.define(
     complaint_status: {
       type: DataTypes.STRING,
       defaultValue: "none",
-      validate: { isIn: [["none", "complained", "valid"]] },
+      validate: {
+        isIn: [
+          [
+            "none",
+            "complained",
+            "under_review",
+            "resolved",
+            "refunded",
+            "completed",
+          ],
+        ],
+      },
     },
+    complaint_reason: { type: DataTypes.STRING },
     // Admin Profit Tracking Fields
     seller_payout_amount: { type: DataTypes.FLOAT },
     admin_profit: { type: DataTypes.FLOAT },
@@ -157,6 +186,20 @@ const Payment = sequelize.define(
     created_at: { type: DataTypes.DATE, defaultValue: Sequelize.NOW },
   },
   { tableName: "payments", timestamps: false },
+);
+
+const AuditLog = sequelize.define(
+  "AuditLog",
+  {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    admin_email: { type: DataTypes.STRING },
+    action: { type: DataTypes.STRING },
+    target_type: { type: DataTypes.STRING },
+    target_id: { type: DataTypes.INTEGER },
+    details: { type: DataTypes.TEXT },
+    created_at: { type: DataTypes.DATE, defaultValue: Sequelize.NOW },
+  },
+  { tableName: "audit_logs", timestamps: false },
 );
 
 // Platform Profit Tracking Model
@@ -188,12 +231,15 @@ const PlatformProfit = sequelize.define(
 );
 
 Card.belongsTo(User, { foreignKey: "seller_id", as: "seller" });
+Card.hasOne(Payment, { foreignKey: "card_id", as: "payment" });
 Payment.belongsTo(Card, { foreignKey: "card_id", as: "card" });
 Payment.belongsTo(User, { foreignKey: "buyer_id", as: "buyer" });
 PlatformProfit.belongsTo(Payment, { foreignKey: "payment_id", as: "payment" });
 PlatformProfit.belongsTo(Card, { foreignKey: "card_id", as: "card" });
 PlatformProfit.belongsTo(User, { foreignKey: "seller_id", as: "seller" });
 PlatformProfit.belongsTo(User, { foreignKey: "buyer_id", as: "buyer" });
+AuditLog.belongsTo(User, { foreignKey: "admin_email", targetKey: "email", as: "admin" });
+AuditLog.belongsTo(Payment, { foreignKey: "target_id", constraints: false, as: "payment" });
 
 // ---------------------------------------------------------
 // Helpers
@@ -261,7 +307,7 @@ async function refundPaymentByLookup({ txHash, paymentId }) {
     : await Payment.findByPk(paymentId);
 
   if (!payment) throw new Error("Payment not found.");
-  if (!["holding", "completed"].includes(payment.status))
+  if (!["holding", "completed", "disputed"].includes(payment.status))
     throw new Error("Payment not eligible for refund.");
   if (!payment.user_address)
     throw new Error("Missing user_address for refund.");
@@ -301,7 +347,7 @@ async function settlePaymentToSeller({ paymentId }) {
       reason: "Payment is under complaint review.",
     };
   }
-  if (payment.status !== "holding") {
+  if (!["holding", "disputed"].includes(payment.status)) {
     return {
       payment,
       didSettle: false,
@@ -322,13 +368,31 @@ async function settlePaymentToSeller({ paymentId }) {
       ? card.seller_wallet_address
       : MAIN_BUSINESS_ACCOUNT;
 
-  // PROFIT LOGIC: Only send the seller's asking price. The remainder stays in the business wallet as profit.
-  const sellerPayoutAmount =
-    card && card.seller_asking_price ? card.seller_asking_price : payment.amount;
-
-  const adminProfitAmount = payment.amount - sellerPayoutAmount;
-
   if (!payoutAddress) throw new Error("No payout address configured.");
+
+  // FETCH CURRENT RATES FOR CONVERSION
+  const rates = await getExchangeRates();
+  const ethPriceInUsd = rates.ETH || 3000;
+  
+  // PROFIT LOGIC: Only send the seller's asking price. The remainder stays in the business wallet as profit.
+  let sellerPayoutAmount = payment.amount; // Default to full amount if no card info
+  
+  if (card && card.seller_asking_price) {
+    const fiatCurrency = card.currency || "USD";
+    const fiatRateToUsd = rates[fiatCurrency] || 1;
+    // Convert fiat asking price to USD then to ETH
+    const askingPriceInEth = (card.seller_asking_price / fiatRateToUsd) / ethPriceInUsd;
+    // Round to 8 decimal places like we do in /buy
+    sellerPayoutAmount = Number(askingPriceInEth.toFixed(8));
+    
+    // Safety check: Payout cannot exceed what the buyer paid
+    if (sellerPayoutAmount > payment.amount) {
+      console.warn(`[SETTLEMENT] Warning: Calculated payout (${sellerPayoutAmount}) exceeds payment amount (${payment.amount}). Capping payout.`);
+      sellerPayoutAmount = payment.amount;
+    }
+  }
+
+  const adminProfitAmount = Number((payment.amount - sellerPayoutAmount).toFixed(8));
 
   const payoutTxHash = await transferFunds({
     to: payoutAddress,
@@ -362,10 +426,15 @@ async function settlePaymentToSeller({ paymentId }) {
       status: "holding",
       locked_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
     });
+  } else {
+    // Update existing profit record if it was already created (e.g. by a previous failed attempt)
+    existingProfit.seller_payout = sellerPayoutAmount;
+    existingProfit.admin_profit = adminProfitAmount;
+    await existingProfit.save();
   }
 
   console.log(
-    `[SETTLEMENT] Payment #${payment.id}: Total ${payment.amount} | Seller: ${sellerPayoutAmount} | Admin: ${adminProfitAmount} | TX: ${payoutTxHash}`,
+    `[SETTLEMENT] Payment #${payment.id}: Total ${payment.amount} ETH | Seller: ${sellerPayoutAmount} ETH | Admin: ${adminProfitAmount} ETH | TX: ${payoutTxHash}`,
   );
 
   return { payment, didSettle: true, payoutTxHash };
@@ -514,10 +583,11 @@ app.post("/buyer/payments/:id/complain", authenticateJWT, async (req, res) => {
       return res.json({ message: "Complaint already filed." });
     }
 
-    // Complaint workflow: keep the payment in escrow ("holding").
-    // Admin can later resolve by confirming valid (release seller payout)
-    // or refunding the buyer.
+    // Complaint workflow: keep the payment in escrow ("holding"), but mark as disputed.
+    const { reason } = req.body;
     payment.complaint_status = "complained";
+    payment.status = "disputed";
+    payment.complaint_reason = reason || "Other issue";
     await payment.save();
 
     res.json({
@@ -642,6 +712,7 @@ app.get("/seller/cards", authenticateJWT, async (req, res) => {
   try {
     const cards = await Card.findAll({
       where: { seller_id: req.user.id },
+      include: [{ model: Payment, as: "payment" }],
       order: [["id", "DESC"]],
     });
     res.json(cards);
@@ -1069,10 +1140,11 @@ app.post("/alchemy-webhook", async (req, res) => {
 // Admin - Refund (Manual API)
 app.post("/admin/refund", requireAdmin, async (req, res) => {
   try {
+    const body = req.body || {};
     const txHash = String(
-      req.body.tx_hash || req.body.external_id || "",
+      body.tx_hash || body.external_id || "",
     ).trim();
-    const paymentId = req.body.payment_id ? Number(req.body.payment_id) : null;
+    const paymentId = body.payment_id ? Number(body.payment_id) : null;
 
     const { payment, refundTxHash } = await refundPaymentByLookup({
       txHash: txHash || null,
@@ -1298,6 +1370,7 @@ async function setupAdminPanel() {
             "retailer",
             "seller_id",
             "card_code",
+            "file_path",
           ],
           properties: {
             price: { label: "Price (ETH)" },
@@ -1408,6 +1481,18 @@ async function setupAdminPanel() {
                 }
               },
             },
+            view_file: {
+              actionType: "record",
+              icon: "View",
+              isVisible: ({ record }) => !!record.params.file_path,
+              handler: async (request, response, context) => {
+                const { record } = context;
+                const path = record.params.file_path;
+                return {
+                  redirectUrl: path.startsWith("http") ? path : `/${path}`,
+                };
+              },
+            },
           },
         },
       },
@@ -1448,6 +1533,7 @@ async function setupAdminPanel() {
             "asset",
             "status",
             "complaint_status",
+            "complaint_reason",
             "profit_status",
             "profit_locked_until",
             "card_id",
@@ -1462,33 +1548,66 @@ async function setupAdminPanel() {
               actionType: "record",
               component: false,
               icon: "Checkmark",
-              guard: "Resolve complaint as valid and release seller payout?",
-              isVisible: ({ record }) =>
-                record.params.status === "holding" &&
-                record.params.complaint_status === "complained",
-              handler: async (request, _response, context) => {
+              label: "✓ Release Fund To Seller",
+              guard: "Resolve complaint as invalid and release seller payout?",
+              isVisible: ({ record }) => {
+                const status = record.param('status');
+                const complaintStatus = record.param('complaint_status');
+                return (
+                  ["disputed", "holding"].includes(status) &&
+                  ["complained", "under_review"].includes(complaintStatus)
+                );
+              },
+              handler: async (request, response, context) => {
                 const { record, currentAdmin } = context;
-                if (request.method !== "post")
-                  return { record: record.toJSON(currentAdmin) };
+                const method = String(request?.method || "get").toLowerCase();
                 try {
-                  const payment = await Payment.findByPk(record.params.id);
-                  if (!payment) throw new Error("Payment not found.");
-                  payment.complaint_status = "valid";
-                  await payment.save();
-                  await settlePaymentToSeller({ paymentId: payment.id });
+                  const paymentId = Number(record.param("id"));
+                  console.log(
+                    `[AdminJS] resolve_valid: Invoked via ${method.toUpperCase()} for payment #${paymentId}`,
+                  );
 
-                  const updated = await Payment.findByPk(payment.id);
-                  return {
-                    record: context.resource.build(updated).toJSON(currentAdmin),
-                    notice: {
-                      message: "Complaint resolved. Seller payout released.",
-                      type: "success",
-                    },
-                  };
-                } catch (err) {
+                  const payment = await Payment.findByPk(paymentId);
+                  if (!payment) {
+                    throw new Error("Payment not found");
+                  }
+
+                  payment.complaint_status = "resolved";
+                  await payment.save();
+
+                  const settlement = await settlePaymentToSeller({ paymentId });
+                  if (!settlement.didSettle && settlement.reason !== "Already settled.") {
+                    throw new Error(settlement.reason || "Settlement failed");
+                  }
+
+                  payment.status = "completed";
+                  await payment.save();
+
+                  await AuditLog.create({
+                    admin_email: currentAdmin.email,
+                    action: "RELEASE_FUND_TO_SELLER",
+                    target_type: "Payment",
+                    target_id: paymentId,
+                    details: `Dispute resolved as invalid. complaint_status=resolved, status=completed. Funds released to seller. Reason given by buyer: ${payment.complaint_reason}. TX: ${settlement.payoutTxHash || payment.payout_tx_hash || "N/A"}`,
+                  });
+
+                  await record.load();
                   return {
                     record: record.toJSON(currentAdmin),
-                    notice: { message: err.message, type: "error" },
+                    notice: {
+                      message: `Funds released to seller. TX: ${settlement.payoutTxHash || payment.payout_tx_hash || "N/A"}`,
+                      type: "success",
+                    },
+                    redirectUrl: "/admin/resources/Payment",
+                  };
+                } catch (error) {
+                  console.error(`[AdminJS] resolve_valid error:`, error.message);
+                  return {
+                    record: record.toJSON(currentAdmin),
+                    notice: {
+                      message: `Error: ${error.message}`,
+                      type: "error",
+                    },
                   };
                 }
               },
@@ -1497,32 +1616,134 @@ async function setupAdminPanel() {
               actionType: "record",
               component: false,
               icon: "Undo",
-              guard: "Refund this payment?",
-              isVisible: ({ record }) =>
-                record.params.status === "holding" &&
-                record.params.complaint_status === "complained",
-              handler: async (request, _response, context) => {
+              label: "↶ Refund Buyer",
+              guard: "Refund this payment and cancel seller payout?",
+              isVisible: ({ record }) => {
+                const status = record.param('status');
+                const complaintStatus = record.param('complaint_status');
+                return (
+                  ["disputed", "holding"].includes(status) &&
+                  ["complained", "under_review"].includes(complaintStatus)
+                );
+              },
+              handler: async (request, response, context) => {
                 const { record, currentAdmin } = context;
-                if (request.method !== "post")
-                  return { record: record.toJSON(currentAdmin) };
+                const method = String(request?.method || "get").toLowerCase();
                 try {
-                  const { payment } = await refundPaymentByLookup({
-                    paymentId: record.params.id,
+                  const paymentId = Number(record.param("id"));
+                  console.log(
+                    `[AdminJS] refund: Invoked via ${method.toUpperCase()} for payment #${paymentId}`,
+                  );
+
+                  const payment = await Payment.findByPk(paymentId);
+                  if (!payment) {
+                    throw new Error("Payment not found");
+                  }
+
+                  const { payment: refundedPayment, refundTxHash } =
+                    await refundPaymentByLookup({
+                      paymentId,
+                    });
+
+                  refundedPayment.complaint_status = "refunded";
+                  refundedPayment.status = "returned";
+                  await refundedPayment.save();
+
+                  await AuditLog.create({
+                    admin_email: currentAdmin.email,
+                    action: "REFUND_BUYER",
+                    target_type: "Payment",
+                    target_id: paymentId,
+                    details: `Dispute resolved as valid. complaint_status=refunded, status=returned. Buyer refunded. TX: ${refundTxHash}. Reason given by buyer: ${payment.complaint_reason}`,
                   });
-                  return {
-                    record: context.resource
-                      .build(payment)
-                      .toJSON(currentAdmin),
-                    notice: { message: "Refund successful.", type: "success" },
-                  };
-                } catch (err) {
+
+                  await record.load();
                   return {
                     record: record.toJSON(currentAdmin),
-                    notice: { message: err.message, type: "error" },
+                    notice: {
+                      message: `Buyer refunded successfully. TX: ${refundTxHash}`,
+                      type: "success",
+                    },
+                    redirectUrl: "/admin/resources/Payment",
+                  };
+                } catch (error) {
+                  console.error(`[AdminJS] refund error:`, error.message);
+                  return {
+                    record: record.toJSON(currentAdmin),
+                    notice: {
+                      message: `Error: ${error.message}`,
+                      type: "error",
+                    },
                   };
                 }
               },
             },
+            view_card_file: {
+              actionType: "record",
+              icon: "View",
+              isVisible: ({ record }) => !!record.params.card_id,
+              handler: async (request, response, context) => {
+                const { record } = context;
+                const payment = await Payment.findByPk(record.params.id, {
+                  include: [{ model: Card, as: "card" }],
+                });
+                if (!payment || !payment.card || !payment.card.file_path) {
+                  return {
+                    notice: { message: "No file found for this card.", type: "error" },
+                  };
+                }
+                const path = payment.card.file_path;
+                return {
+                  redirectUrl: path.startsWith("http") ? path : `/${path}`,
+                };
+              },
+            },
+            mark_under_review: {
+              actionType: "record",
+              component: false,
+              icon: "Search",
+              label: "Mark Under Review",
+              isVisible: ({ record }) =>
+                record.params.complaint_status === "complained",
+              handler: async (request, _response, context) => {
+                const { record, currentAdmin } = context;
+                try {
+                  await record.update({ complaint_status: "under_review" });
+                  await AuditLog.create({
+                    admin_email: currentAdmin.email,
+                    action: "MARK_UNDER_REVIEW",
+                    target_type: "Payment",
+                    target_id: record.params.id,
+                    details: `Dispute marked as under review by admin.`,
+                  });
+                  await record.load();
+                  return {
+                    record: record.toJSON(currentAdmin),
+                    notice: {
+                      message: "Dispute is now under review.",
+                      type: "info",
+                    },
+                    redirectUrl: "/admin/resources/Payment",
+                  };
+                } catch (error) {
+                  return {
+                    record: record.toJSON(currentAdmin),
+                    notice: { message: error.message, type: "error" },
+                  };
+                }
+              },
+            },
+          },
+        },
+      },
+      {
+        resource: AuditLog,
+        options: {
+          navigation: { name: "System Logs", icon: "View" },
+          actions: {
+            new: { isAccessible: false },
+            edit: { isAccessible: false },
+            delete: { isAccessible: false },
           },
         },
       },
