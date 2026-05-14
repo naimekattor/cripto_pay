@@ -10,7 +10,15 @@ const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const axios = require("axios");
+const nodemailer = require("nodemailer");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
+
+// AdminJS writes user components to ADMIN_JS_TMP_DIR when the bundler module loads.
+// Default `.adminjs` is relative to process.cwd(), so `node ../backend/index.js` breaks the bundle path.
+// Pin it next to this file so the custom dashboard always bundles and is served correctly.
+if (!process.env.ADMIN_JS_TMP_DIR) {
+  process.env.ADMIN_JS_TMP_DIR = path.join(__dirname, ".adminjs");
+}
 
 const app = express();
 app.set("trust proxy", 1); // Essential for session cookies behind proxies/tunnels
@@ -55,16 +63,33 @@ const jsonParser = express.json();
 const urlencodedParser = express.urlencoded({ extended: true });
 
 app.use((req, res, next) => {
-  // Skip body parsing only for AdminJS UI/API routes; keep custom /admin REST endpoints parsed.
-  const isAdminJsRoute =
-    req.originalUrl === "/admin" ||
-    req.originalUrl.startsWith("/admin/") &&
-      !req.originalUrl.startsWith("/admin/cards/") &&
-      !req.originalUrl.startsWith("/admin/refund") &&
-      !req.originalUrl.startsWith("/admin/profit/");
-  if (isAdminJsRoute) {
+  // Apply no-cache headers to all AdminJS routes immediately to prevent 304/Refresh issues
+  if (req.originalUrl.startsWith("/admin")) {
+    res.set(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0",
+    );
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.set("ETag", undefined);
+
+    if (req.method === "GET") {
+      res.set("Last-Modified", new Date().toUTCString());
+    }
+  }
+
+  // Skip body parsing for AdminJS UI/API routes to avoid conflicts with its internal parser
+  const isAdminJsInternalRoute =
+    (req.originalUrl === "/admin" || req.originalUrl.startsWith("/admin/")) &&
+    !req.originalUrl.startsWith("/admin/cards/") &&
+    !req.originalUrl.startsWith("/admin/refund") &&
+    !req.originalUrl.startsWith("/admin/profit/") &&
+    !req.originalUrl.startsWith("/admin/add-card");
+
+  if (isAdminJsInternalRoute) {
     return next();
   }
+
   jsonParser(req, res, (err) => {
     if (err) return next(err);
     urlencodedParser(req, res, next);
@@ -93,6 +118,11 @@ const User = sequelize.define(
       validate: { isIn: [["buyer", "seller", "admin"]] },
       defaultValue: "buyer",
     },
+    is_verified: { type: DataTypes.BOOLEAN, defaultValue: false },
+    verification_code: { type: DataTypes.STRING, allowNull: true },
+    verification_code_expires: { type: DataTypes.DATE, allowNull: true },
+    reset_password_code: { type: DataTypes.STRING, allowNull: true },
+    reset_password_expires: { type: DataTypes.DATE, allowNull: true },
     created_at: { type: DataTypes.DATE, defaultValue: Sequelize.NOW },
   },
   { tableName: "users", timestamps: false },
@@ -244,6 +274,37 @@ AuditLog.belongsTo(Payment, { foreignKey: "target_id", constraints: false, as: "
 // ---------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------
+async function sendEmail({ to, subject, text, html }) {
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || "smtp.gmail.com",
+    port: Number(process.env.SMTP_PORT || 465),
+    secure: Number(process.env.SMTP_PORT) === 465,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+
+  try {
+    await transporter.sendMail({
+      from: `"GiftCard Crypto" <${process.env.SMTP_USER}>`,
+      to,
+      subject,
+      text,
+      html,
+    });
+    console.log(`[EMAIL] Sent to ${to}: ${subject}`);
+  } catch (error) {
+    console.error(`[EMAIL ERROR] Failed to send to ${to}:`, error.message);
+    // Don't throw if email fails in dev, but log it
+    if (process.env.NODE_ENV === 'production') throw error;
+  }
+}
+
+function generate4DigitCode() {
+  return Math.floor(1000 + Math.random() * 9000).toString();
+}
+
 function normalizeAsset(asset, category) {
   const upper = (asset || "").toUpperCase();
   if (upper === "USDC") return "USDC";
@@ -373,10 +434,10 @@ async function settlePaymentToSeller({ paymentId }) {
   // FETCH CURRENT RATES FOR CONVERSION
   const rates = await getExchangeRates();
   const ethPriceInUsd = rates.ETH || 3000;
-  
+
   // PROFIT LOGIC: Only send the seller's asking price. The remainder stays in the business wallet as profit.
   let sellerPayoutAmount = payment.amount; // Default to full amount if no card info
-  
+
   if (card && card.seller_asking_price) {
     const fiatCurrency = card.currency || "USD";
     const fiatRateToUsd = rates[fiatCurrency] || 1;
@@ -384,7 +445,7 @@ async function settlePaymentToSeller({ paymentId }) {
     const askingPriceInEth = (card.seller_asking_price / fiatRateToUsd) / ethPriceInUsd;
     // Round to 8 decimal places like we do in /buy
     sellerPayoutAmount = Number(askingPriceInEth.toFixed(8));
-    
+
     // Safety check: Payout cannot exceed what the buyer paid
     if (sellerPayoutAmount > payment.amount) {
       console.warn(`[SETTLEMENT] Warning: Calculated payout (${sellerPayoutAmount}) exceeds payment amount (${payment.amount}). Capping payout.`);
@@ -466,7 +527,7 @@ function requireAdmin(req, res, next) {
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
       if (decoded.role === "admin") return next();
-    } catch (e) {}
+    } catch (e) { }
   }
   return res.status(401).json({ error: "Unauthorized admin request." });
 }
@@ -504,11 +565,102 @@ app.post("/auth/register", async (req, res) => {
     if (existing) {
       return res.status(409).json({ error: "Email already in use." });
     }
+
+    const verification_code = generate4DigitCode();
+    const verification_code_expires = new Date(Date.now() + 3600000); // 1 hour
+
     const password_hash = await bcrypt.hash(password, 10);
-    const user = await User.create({ email, password_hash, role });
+    const user = await User.create({
+      email,
+      password_hash,
+      role,
+      verification_code,
+      verification_code_expires,
+      is_verified: false
+    });
+
+    // Send verification email
+    await sendEmail({
+      to: email,
+      subject: "Verify your account - GiftCard Crypto",
+      text: `Your verification code is: ${verification_code}`,
+      html: `<div style="font-family: sans-serif; padding: 20px; color: #333;">
+              <h2>Welcome to GiftCard Crypto!</h2>
+              <p>Please use the following 4-digit code to verify your account:</p>
+              <div style="font-size: 32px; font-weight: bold; letter-spacing: 5px; color: #2563eb; margin: 20px 0;">
+                ${verification_code}
+              </div>
+              <p>This code will expire in 1 hour.</p>
+            </div>`
+    });
+
     res
       .status(201)
-      .json({ message: "User registered successfully.", id: user.id });
+      .json({ message: "User registered. Please check your email for the verification code.", id: user.id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/auth/verify", async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    console.log(`[AUTH] Verify attempt for: ${email}, Code: ${code}`);
+    const user = await User.findOne({ where: { email } });
+    if (!user) {
+      console.log(`[AUTH] Verify failed: User not found for ${email}`);
+      return res.status(400).json({ error: "User not found" });
+    }
+    if (user.is_verified) return res.status(400).json({ error: "User already verified" });
+
+    if (user.verification_code !== code) {
+      return res.status(400).json({ error: "Invalid verification code" });
+    }
+
+    if (new Date() > user.verification_code_expires) {
+      return res.status(400).json({ error: "Verification code expired" });
+    }
+
+    user.is_verified = true;
+    user.verification_code = null;
+    user.verification_code_expires = null;
+    await user.save();
+
+    res.json({ message: "Email verified successfully. You can now log in." });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/auth/resend-verification", async (req, res) => {
+  try {
+    const { email } = req.body;
+    const user = await User.findOne({ where: { email } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.is_verified) return res.status(400).json({ error: "User already verified" });
+
+    const verification_code = generate4DigitCode();
+    const verification_code_expires = new Date(Date.now() + 3600000);
+
+    user.verification_code = verification_code;
+    user.verification_code_expires = verification_code_expires;
+    await user.save();
+
+    await sendEmail({
+      to: email,
+      subject: "Your new verification code - GiftCard Crypto",
+      text: `Your new verification code is: ${verification_code}`,
+      html: `<div style="font-family: sans-serif; padding: 20px; color: #333;">
+              <h2>New Verification Code</h2>
+              <p>Use the following 4-digit code to verify your account:</p>
+              <div style="font-size: 32px; font-weight: bold; letter-spacing: 5px; color: #2563eb; margin: 20px 0;">
+                ${verification_code}
+              </div>
+              <p>This code will expire in 1 hour.</p>
+            </div>`
+    });
+
+    res.json({ message: "A new verification code has been sent to your email." });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -520,6 +672,10 @@ app.post("/auth/login", async (req, res) => {
     const user = await User.findOne({ where: { email } });
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
+    if (!user.is_verified) {
+      return res.status(403).json({ error: "unverified", message: "Please verify your email before logging in." });
+    }
+
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) return res.status(401).json({ error: "Invalid credentials" });
 
@@ -527,6 +683,68 @@ app.post("/auth/login", async (req, res) => {
       expiresIn: "24h",
     });
     res.json({ token, role: user.role, email: user.email });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/auth/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body;
+    const user = await User.findOne({ where: { email } });
+    if (!user) {
+      // Don't leak user existence in prod, but for now we can be specific
+      return res.status(404).json({ error: "If that email exists, we've sent a reset code." });
+    }
+
+    const reset_password_code = generate4DigitCode();
+    const reset_password_expires = new Date(Date.now() + 3600000);
+
+    user.reset_password_code = reset_password_code;
+    user.reset_password_expires = reset_password_expires;
+    await user.save();
+
+    await sendEmail({
+      to: email,
+      subject: "Password Reset Request - GiftCard Crypto",
+      text: `Your password reset code is: ${reset_password_code}`,
+      html: `<div style="font-family: sans-serif; padding: 20px; color: #333;">
+              <h2>Password Reset Request</h2>
+              <p>We received a request to reset your password. Use the following 4-digit code:</p>
+              <div style="font-size: 32px; font-weight: bold; letter-spacing: 5px; color: #dc2626; margin: 20px 0;">
+                ${reset_password_code}
+              </div>
+              <p>This code will expire in 1 hour. If you didn't request this, please ignore this email.</p>
+            </div>`
+    });
+
+    res.json({ message: "Password reset code sent to your email." });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/auth/reset-password", async (req, res) => {
+  try {
+    const { email, code, newPassword } = req.body;
+    const user = await User.findOne({ where: { email } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    if (user.reset_password_code !== code) {
+      return res.status(400).json({ error: "Invalid reset code" });
+    }
+
+    if (new Date() > user.reset_password_expires) {
+      return res.status(400).json({ error: "Reset code expired" });
+    }
+
+    const password_hash = await bcrypt.hash(newPassword, 10);
+    user.password_hash = password_hash;
+    user.reset_password_code = null;
+    user.reset_password_expires = null;
+    await user.save();
+
+    res.json({ message: "Password reset successfully. You can now log in with your new password." });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -637,10 +855,10 @@ app.post("/buyer/payments/:id/confirm", authenticateJWT, async (req, res) => {
       message: "Card confirmed as valid.",
       settlement: settlement
         ? {
-            did_settle: Boolean(settlement.didSettle),
-            payout_tx_hash: settlement.payoutTxHash || null,
-            payment_status: settlement.payment?.status || payment.status,
-          }
+          did_settle: Boolean(settlement.didSettle),
+          payout_tx_hash: settlement.payoutTxHash || null,
+          payment_status: settlement.payment?.status || payment.status,
+        }
         : null,
     });
   } catch (error) {
@@ -871,38 +1089,38 @@ app.post(
 
 // Public - Sell Card
 app.post("/cards/sell", authenticateJWT, upload.single("file"), async (req, res) => {
-    try {
-      if (req.user.role !== "seller") return res.status(403).json({ error: "Access denied" });
-      const { retailer, price, card_code, card_pin, seller_wallet_address, region, currency } = req.body;
-      const amount = parseAmount(price);
+  try {
+    if (req.user.role !== "seller") return res.status(403).json({ error: "Access denied" });
+    const { retailer, price, card_code, card_pin, seller_wallet_address, region, currency } = req.body;
+    const amount = parseAmount(price);
 
-      if (!retailer || !amount || !card_code || !seller_wallet_address) {
-        if (req.file?.path) fs.unlink(req.file.path, () => undefined);
-        return res.status(400).json({ error: "retailer, price, card_code and seller_wallet_address are required." });
-      }
-
-      const card = await Card.create({
-        name: `${retailer} Gift Card`,
-        description: `Gift card for ${retailer} (${region})`,
-        price: amount,
-        seller_asking_price: amount,
-        denomination: 0,
-        file_path: req.file ? `uploads/${req.file.filename}` : "",
-        status: "pending_approval",
-        retailer,
-        card_code,
-        card_pin,
-        seller_wallet_address,
-        region: region || "USA",
-        currency: currency || "USD",
-        seller_id: req.user.id,
-      });
-
-      return res.status(201).json({ message: "Card listed successfully.", card_id: card.id });
-    } catch (error) {
-      return res.status(500).json({ error: error.message });
+    if (!retailer || !amount || !card_code || !seller_wallet_address) {
+      if (req.file?.path) fs.unlink(req.file.path, () => undefined);
+      return res.status(400).json({ error: "retailer, price, card_code and seller_wallet_address are required." });
     }
+
+    const card = await Card.create({
+      name: `${retailer} Gift Card`,
+      description: `Gift card for ${retailer} (${region})`,
+      price: amount,
+      seller_asking_price: amount,
+      denomination: 0,
+      file_path: req.file ? `uploads/${req.file.filename}` : "",
+      status: "pending_approval",
+      retailer,
+      card_code,
+      card_pin,
+      seller_wallet_address,
+      region: region || "USA",
+      currency: currency || "USD",
+      seller_id: req.user.id,
+    });
+
+    return res.status(201).json({ message: "Card listed successfully.", card_id: card.id });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
   }
+}
 );
 
 // Public - Get Active Cards
@@ -955,7 +1173,7 @@ app.post("/buy", authenticateJWT, async (req, res) => {
       // If it's pending and belongs to the SAME user, let them resume
       if (existingPayment.buyer_id === req.user.id) {
         console.log(`[BUY] Resuming existing pending payment ${existingPayment.id} for user ${req.user.id}`);
-        
+
         // RECALCULATE amount to handle cases where rates changed or old records have fiat values
         const rates = await getExchangeRates();
         const fiatCurrency = card.currency || "USD";
@@ -963,7 +1181,7 @@ app.post("/buy", authenticateJWT, async (req, res) => {
         const fiatRateToUsd = rates[fiatCurrency] || 1;
         const amountInEth = (card.price / fiatRateToUsd) / ethPriceInUsd;
         const finalEthAmount = Number(amountInEth.toFixed(8));
-        
+
         existingPayment.amount = finalEthAmount;
         await existingPayment.save();
 
@@ -1001,9 +1219,9 @@ app.post("/buy", authenticateJWT, async (req, res) => {
 
     // Convert card fiat price to USD, then to ETH
     const amountInUsd = card.price / fiatRateToUsd;
-const amountInEth = (card.price / fiatRateToUsd) / ethPriceInUsd;
+    const amountInEth = (card.price / fiatRateToUsd) / ethPriceInUsd;
     // We'll round to 6 decimal places for the ETH amount
-const finalEthAmount = Number(amountInEth.toFixed(8));
+    const finalEthAmount = Number(amountInEth.toFixed(8));
     console.log(`[BUY] Converting ${card.price} ${fiatCurrency} to ETH. Rate: 1 ETH = ${ethPriceInUsd} USD. Final: ${finalEthAmount} ETH`);
 
     if (!MAIN_BUSINESS_ACCOUNT) {
@@ -1337,18 +1555,74 @@ app.get("/download/:tx_hash", async (req, res) => {
 // AdminJS Configuration
 // ---------------------------------------------------------
 async function setupAdminPanel() {
-  const [{ default: AdminJS }, { default: AdminJSExpress }, AdminJSSequelize] =
-    await Promise.all([
-      import("adminjs"),
-      import("@adminjs/express"),
-      import("@adminjs/sequelize"),
-    ]);
+  const [
+    { default: AdminJS, ComponentLoader },
+    { default: AdminJSExpress },
+    AdminJSSequelize,
+  ] = await Promise.all([
+    import("adminjs"),
+    import("@adminjs/express"),
+    import("@adminjs/sequelize"),
+  ]);
+
+  const componentLoader = new ComponentLoader();
+
+  const Components = {
+    // Absolute path: AdminJS resolves relative paths via stack traces, which can break on Windows
+    // or when `setupAdminPanel` is not the direct caller. `__dirname` always points at this file.
+    Dashboard: componentLoader.add(
+      "Dashboard",
+      path.join(__dirname, "dashboard.jsx"),
+    ),
+  };
 
   AdminJS.registerAdapter(AdminJSSequelize);
 
   const admin = new AdminJS({
     rootPath: "/admin",
-    branding: { companyName: "Gift Card Admin" },
+    branding: {
+      companyName: "GitCard Crypto Admin",
+      logo: "/admin_logo.png",
+      softwareBrothers: false, // Hide AdminJS branding for a cleaner look
+      theme: {
+        colors: {
+          primary100: "#0f172a", // Dark slate for premium feel
+          primary80: "#1e293b",
+          primary60: "#334155",
+          primary40: "#475569",
+          primary20: "#64748b",
+          accent: "#ea580c",     // Orange accent
+          hoverBg: "#f8fafc",
+          bg: "#f1f5f9",         // Light app background
+          white: "#ffffff",
+          grey100: "#020617",
+          grey80: "#0f172a",
+          grey60: "#334155",
+          grey40: "#64748b",
+          grey20: "#cbd5e1",
+          border: "#e2e8f0",
+          error: "#ef4444",
+          success: "#10b981",
+          info: "#3b82f6",
+        },
+        font: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
+        shadows: {
+          cardHover: "0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)",
+          loginCard: "0 25px 50px -12px rgba(0, 0, 0, 0.25)",
+        },
+        borderRadius: {
+          default: "8px",
+          card: "16px",
+        },
+        borders: {
+          default: "1px solid #e2e8f0",
+        },
+      },
+    },
+    componentLoader,
+    dashboard: {
+      component: Components.Dashboard,
+    },
     resources: [
       {
         resource: User,
@@ -1428,7 +1702,7 @@ async function setupAdminPanel() {
                       message: "Card approved and now active!",
                       type: "success",
                     },
-                    redirectUrl: "/admin/resources/Card",
+                    redirectUrl: "/admin/resources/cards",
                   };
                 } catch (error) {
                   console.error(`[AdminJS] ✗ Approve failed:`, error);
@@ -1467,7 +1741,7 @@ async function setupAdminPanel() {
                       message: "Card listing rejected.",
                       type: "error", // Kept as error type for red UI feedback
                     },
-                    redirectUrl: "/admin/resources/Card",
+                    redirectUrl: "/admin/resources/cards",
                   };
                 } catch (error) {
                   console.error(`[AdminJS] ✗ Reject failed:`, error);
@@ -1598,7 +1872,7 @@ async function setupAdminPanel() {
                       message: `Funds released to seller. TX: ${settlement.payoutTxHash || payment.payout_tx_hash || "N/A"}`,
                       type: "success",
                     },
-                    redirectUrl: "/admin/resources/Payment",
+                    redirectUrl: "/admin/resources/payments",
                   };
                 } catch (error) {
                   console.error(`[AdminJS] resolve_valid error:`, error.message);
@@ -1664,7 +1938,7 @@ async function setupAdminPanel() {
                       message: `Buyer refunded successfully. TX: ${refundTxHash}`,
                       type: "success",
                     },
-                    redirectUrl: "/admin/resources/Payment",
+                    redirectUrl: "/admin/resources/payments",
                   };
                 } catch (error) {
                   console.error(`[AdminJS] refund error:`, error.message);
@@ -1723,7 +1997,7 @@ async function setupAdminPanel() {
                       message: "Dispute is now under review.",
                       type: "info",
                     },
-                    redirectUrl: "/admin/resources/Payment",
+                    redirectUrl: "/admin/resources/payments",
                   };
                 } catch (error) {
                   return {
@@ -1795,6 +2069,21 @@ async function setupAdminPanel() {
     ],
   });
 
+  // Build custom React components (dashboard, etc.) before the router serves AdminJS.
+  // Without this: production can serve an empty/missing bundle (initialize() is async and not awaited),
+  // and dev can point Rollup at the wrong .adminjs folder when cwd !== __dirname.
+  const { componentsBundler, generateUserComponentEntry, ADMIN_JS_TMP_DIR } =
+    await import("adminjs/bundler");
+  await componentsBundler.createEntry({
+    content: generateUserComponentEntry(admin, ADMIN_JS_TMP_DIR),
+  });
+  await componentsBundler.build();
+  console.log("[AdminJS] User components bundle ready at", ADMIN_JS_TMP_DIR);
+
+  if (process.env.NODE_ENV === "production") {
+    await admin.initialize();
+  }
+
   const adminRouter = AdminJSExpress.buildAuthenticatedRouter(
     admin,
     {
@@ -1820,9 +2109,6 @@ async function setupAdminPanel() {
       },
     },
   );
-
-  app.get("/admin", (req, res) => res.redirect("/admin/resources/Payment"));
-  app.get("/admin/", (req, res) => res.redirect("/admin/resources/Payment"));
 
   app.use(admin.options.rootPath, adminRouter);
 }
@@ -1860,24 +2146,7 @@ app.get("/health", (_req, res) => {
 // ---------------------------------------------------------
 // Middleware for AdminJS - Prevent Caching & 304 Errors
 // ---------------------------------------------------------
-app.use((req, res, next) => {
-  // Apply no-cache headers to all AdminJS routes
-  if (req.path.startsWith("/admin")) {
-    res.set(
-      "Cache-Control",
-      "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0",
-    );
-    res.set("Pragma", "no-cache");
-    res.set("Expires", "0");
-    res.set("ETag", undefined);
-
-    // Ensure responses won't return 304 Not Modified
-    if (req.method === "GET") {
-      res.set("Last-Modified", new Date().toUTCString());
-    }
-  }
-  next();
-});
+// Moved to top-level middleware to fix AdminJS refresh issues
 
 // ---------------------------------------------------------
 // Startup
