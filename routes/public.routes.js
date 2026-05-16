@@ -13,10 +13,10 @@ const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
 router.get("/cards", async (_req, res) => {
   try {
     const cards = await Card.findAll({
-      where: { status: "active" },
+      where: { status: "active", isValid: true },
       attributes: [
         "id", "name", "description", "price", "status", "retailer",
-        "denomination", "region", "currency", "file_path",
+        "denomination", "region", "currency", "file_path", "seller_asking_price"
       ],
       order: [["id", "DESC"]],
     });

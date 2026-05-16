@@ -41,6 +41,7 @@ const Payment = sequelize.define(
             "resolved",
             "refunded",
             "completed",
+            "valid",
           ],
         ],
       },

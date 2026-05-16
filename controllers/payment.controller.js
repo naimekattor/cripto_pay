@@ -79,11 +79,11 @@ async function settlePaymentToSeller({ paymentId }) {
 
   let sellerPayoutAmount = payment.amount;
 
-  if (card && card.seller_asking_price) {
+  if (card && card.sellerReceives) {
     const fiatCurrency = card.currency || "USD";
     const fiatRateToUsd = rates[fiatCurrency] || 1;
-    const askingPriceInEth = (card.seller_asking_price / fiatRateToUsd) / ethPriceInUsd;
-    sellerPayoutAmount = Number(askingPriceInEth.toFixed(8));
+    const sellerNetInEth = (card.sellerReceives / fiatRateToUsd) / ethPriceInUsd;
+    sellerPayoutAmount = Number(sellerNetInEth.toFixed(8));
 
     if (sellerPayoutAmount > payment.amount) {
       console.warn(`[SETTLEMENT] Warning: Calculated payout (${sellerPayoutAmount}) exceeds payment amount (${payment.amount}). Capping payout.`);

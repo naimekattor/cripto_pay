@@ -3,6 +3,7 @@ const Card = require("./card.model");
 const Payment = require("./payment.model");
 const AuditLog = require("./auditLog.model");
 const PlatformProfit = require("./platformProfit.model");
+const Setting = require("./setting.model");
 
 Card.belongsTo(User, { foreignKey: "seller_id", as: "seller" });
 Card.hasOne(Payment, { foreignKey: "card_id", as: "payment" });
@@ -20,5 +21,6 @@ module.exports = {
   Card,
   Payment,
   AuditLog,
-  PlatformProfit
+  PlatformProfit,
+  Setting
 };

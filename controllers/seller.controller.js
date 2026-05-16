@@ -1,4 +1,4 @@
-const { Card, Payment } = require("../models");
+const { Card, Payment, Setting } = require("../models");
 const { parseAmount } = require("../utils/helpers");
 const { Op } = require("sequelize");
 const fs = require("fs");
@@ -57,6 +57,8 @@ exports.cancelCard = async (req, res) => {
   }
 };
 
+const { retailerValidation } = require("../utils/retailerConfig");
+
 exports.sellCard = async (req, res) => {
   try {
     if (req.user.role !== "seller") return res.status(403).json({ error: "Access denied" });
@@ -68,14 +70,60 @@ exports.sellCard = async (req, res) => {
       return res.status(400).json({ error: "retailer, price, card_code and seller_wallet_address are required." });
     }
 
+    // Validation Logic
+    const configKey = region === "UK" ? (retailer === "Uber" ? "Uber_UK" : (retailer === "PlayStation" ? "PlayStation_UK" : retailer)) : (region === "Canada" && retailer === "Amazon" ? "Amazon_CA" : retailer);
+    const config = retailerValidation[configKey];
+
+    let isValid = true;
+    let validationStatus = "VALID";
+    let status = "pending_approval";
+
+    if (config) {
+      // Validate digits
+      if (card_code.length !== config.digits) {
+        isValid = false;
+        validationStatus = "INVALID";
+        status = "invalid";
+      }
+
+      // Validate prefix
+      if (config.startsWith.length > 0) {
+        const matchesPrefix = config.startsWith.some(prefix => card_code.startsWith(prefix));
+        if (!matchesPrefix) {
+          isValid = false;
+          validationStatus = "INVALID";
+          status = "invalid";
+        }
+      }
+
+      // Validate PIN
+      if (config.pinRequired && !card_pin) {
+        isValid = false;
+        validationStatus = "INVALID";
+        status = "invalid";
+      }
+    }
+
+    // Pricing Logic
+    const sellerRate = config ? config.sellerRate : 0.75;
+    const buyerRate = config ? config.buyerRate : 0.85;
+
+    // Fetch default platform charge from settings
+    const chargeSetting = await Setting.findOne({ where: { key: "PLATFORM_CHARGE_PERCENTAGE" } });
+    const platformChargePercentage = chargeSetting ? parseFloat(chargeSetting.value) : 10;
+
+    const buyerPays = amount * buyerRate;
+    const platformProfit = amount * (platformChargePercentage / 100);
+    const sellerReceives = buyerPays - platformProfit;
+
     const card = await Card.create({
       name: `${retailer} Gift Card`,
       description: `Gift card for ${retailer} (${region})`,
-      price: amount,
-      seller_asking_price: amount,
-      denomination: 0,
+      price: buyerPays, // The price the buyer actually pays
+      seller_asking_price: amount, // The face value of the card
+      denomination: amount,
       file_path: req.file ? `uploads/${req.file.filename}` : "",
-      status: "pending_approval",
+      status: status,
       retailer,
       card_code,
       card_pin,
@@ -83,9 +131,20 @@ exports.sellCard = async (req, res) => {
       region: region || "USA",
       currency: currency || "USD",
       seller_id: req.user.id,
+      isValid: isValid,
+      validationStatus: validationStatus,
+      sellerReceives: sellerReceives,
+      buyerPays: buyerPays,
+      platformProfit: platformProfit,
+      platformChargePercentage: platformChargePercentage,
     });
 
-    return res.status(201).json({ message: "Card listed successfully.", card_id: card.id });
+    return res.status(201).json({ 
+      message: isValid ? "Card listed successfully." : "Card listing failed validation.", 
+      card_id: card.id,
+      isValid,
+      sellerReceives
+    });
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }

@@ -1,5 +1,5 @@
 const path = require("path");
-const { User, Card, Payment, AuditLog, PlatformProfit } = require("../models");
+const { User, Card, Payment, AuditLog, PlatformProfit, Setting } = require("../models");
 const { settlePaymentToSeller, refundPaymentByLookup } = require("../controllers/payment.controller");
 
 const ADMIN_PANEL_EMAIL = process.env.ADMIN_PANEL_EMAIL || "admin@example.com";
@@ -75,8 +75,8 @@ async function setupAdminPanel(app) {
             seller_asking_price: { label: "Seller Asking Price (ETH)" },
             denomination: { isVisible: false },
           },
-          showProperties: ["id", "name", "description", "price", "seller_asking_price", "status", "retailer", "seller_id", "card_code", "card_pin", "file_path"],
-          editProperties: ["name", "description", "price", "status", "retailer", "card_code", "card_pin"],
+          showProperties: ["id", "name", "description", "price", "seller_asking_price", "status", "retailer", "seller_id", "card_code", "card_pin", "file_path", "platformChargePercentage", "sellerReceives", "buyerPays", "platformProfit", "isValid"],
+          editProperties: ["name", "description", "price", "status", "retailer", "card_code", "card_pin", "platformChargePercentage"],
           actions: {
             approve: {
               actionType: "record",
@@ -287,8 +287,13 @@ async function setupAdminPanel(app) {
       {
         resource: AuditLog,
         options: {
-          navigation: { name: "System Logs", icon: "View" },
-          actions: { new: { isAccessible: false }, edit: { isAccessible: false }, delete: { isAccessible: false } },
+          navigation: { name: "System Logs", icon: "Catalog" },
+          listProperties: ["id", "admin_email", "action", "target_type", "target_id", "created_at"],
+          actions: {
+            new: { isVisible: false },
+            edit: { isVisible: false },
+            delete: { isVisible: false },
+          },
         },
       },
       {
@@ -302,6 +307,14 @@ async function setupAdminPanel(app) {
             admin_profit: { label: "Admin Profit (ETH)" },
           },
           editProperties: ["status", "locked_until"],
+        },
+      },
+      {
+        resource: Setting,
+        options: {
+          navigation: { name: "Platform Config", icon: "Settings" },
+          listProperties: ["id", "key", "value", "description"],
+          editProperties: ["value", "description"],
         },
       },
     ],

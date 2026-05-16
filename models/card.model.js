@@ -14,7 +14,7 @@ const Card = sequelize.define(
       type: DataTypes.STRING,
       defaultValue: "pending_approval",
       validate: {
-        isIn: [["pending_approval", "active", "sold", "cancelled", "rejected"]],
+        isIn: [["pending_approval", "active", "sold", "cancelled", "rejected", "invalid"]],
       },
     },
     retailer_wallet_address: { type: DataTypes.STRING },
@@ -26,8 +26,39 @@ const Card = sequelize.define(
     region: { type: DataTypes.STRING, defaultValue: "USA" },
     currency: { type: DataTypes.STRING, defaultValue: "USD" },
     seller_id: { type: DataTypes.INTEGER },
+    validationStatus: {
+      type: DataTypes.STRING,
+      defaultValue: "PENDING",
+      validate: { isIn: [["PENDING", "VALID", "INVALID"]] },
+    },
+    sellerReceives: { type: DataTypes.FLOAT },
+    buyerPays: { type: DataTypes.FLOAT },
+    platformProfit: { type: DataTypes.FLOAT },
+    isValid: { type: DataTypes.BOOLEAN, defaultValue: false },
+    platformChargePercentage: { type: DataTypes.FLOAT, defaultValue: 10 },
   },
   { tableName: "cards", timestamps: false }
 );
+
+Card.beforeSave(async (card) => {
+  // If price (buyerPays) or platformChargePercentage is updated, recalculate fields
+  // We use seller_asking_price as the base denomination
+  if (card.changed('platformChargePercentage') || card.changed('seller_asking_price')) {
+    // Note: In a real app, we might need the retailer rates here too.
+    // For now, we'll maintain the logic that buyerPays is the market price,
+    // and platformProfit is determined by the percentage.
+    
+    // If buyerPays is not set yet (new record), we'll let the controller handle it first,
+    // but the hook will ensure consistency on updates.
+    if (card.seller_asking_price && card.platformChargePercentage !== undefined) {
+       const charge = card.seller_asking_price * (card.platformChargePercentage / 100);
+       card.platformProfit = charge;
+       // We assume buyerPays is already set by controller or admin
+       if (card.buyerPays) {
+         card.sellerReceives = card.buyerPays - charge;
+       }
+    }
+  }
+});
 
 module.exports = Card;
