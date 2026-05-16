@@ -127,9 +127,18 @@ router.post("/alchemy-webhook", async (req, res) => {
       const pending = pendingPayments[0];
       pending.external_id = hash;
       pending.user_address = fromAddress;
+      pending.asset_decimals = decimals;
+
+      // Rate Locking Check
+      if (pending.expires_at && new Date() > new Date(pending.expires_at)) {
+        pending.status = "expired";
+        await pending.save();
+        ignored.push({ reason: "rate_expired", hash, payment_id: pending.id, expired_at: pending.expires_at });
+        continue;
+      }
+
       pending.status = "holding";
       pending.release_at = computeReleaseAt();
-      pending.asset_decimals = decimals;
       await pending.save();
 
       const card = await Card.findByPk(pending.card_id);

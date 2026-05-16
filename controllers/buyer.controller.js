@@ -163,6 +163,7 @@ exports.buyCard = async (req, res) => {
       return res.status(500).json({ error: "The server is not configured with a destination wallet for payments." });
     }
 
+    const expiresAt = new Date(Date.now() + 20 * 60 * 1000); // 20 minutes from now
     const intent = await Payment.create({
       amount: finalEthAmount,
       status: "pending",
@@ -171,6 +172,9 @@ exports.buyCard = async (req, res) => {
       asset: "ETH",
       asset_decimals: 18,
       user_address: req.body.wallet_address || null,
+      fiat_amount: card.price,
+      fiat_currency: card.currency,
+      expires_at: expiresAt,
     });
 
     return res.status(201).json({
@@ -183,6 +187,7 @@ exports.buyCard = async (req, res) => {
       asset: "ETH",
       pay_to: wallet ? wallet.address : "WALLET_NOT_CONFIGURED",
       hold_period_hours: HOLD_HOURS,
+      expires_at: expiresAt,
     });
   } catch (error) {
     return res.status(500).json({ error: error.message });

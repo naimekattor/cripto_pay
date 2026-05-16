@@ -20,6 +20,7 @@ const Payment = sequelize.define(
             "returned",
             "disputed",
             "refunded",
+            "expired",
           ],
         ],
       },
@@ -27,6 +28,9 @@ const Payment = sequelize.define(
     card_id: { type: DataTypes.INTEGER },
     buyer_id: { type: DataTypes.INTEGER },
     release_at: { type: DataTypes.DATE },
+    expires_at: { type: DataTypes.DATE },
+    fiat_amount: { type: DataTypes.FLOAT },
+    fiat_currency: { type: DataTypes.STRING },
     asset: { type: DataTypes.STRING, defaultValue: "ETH" },
     asset_decimals: { type: DataTypes.INTEGER, defaultValue: 18 },
     complaint_status: {

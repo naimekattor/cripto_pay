@@ -80,6 +80,20 @@ cron.schedule("0 * * * *", async () => {
         console.error(`Settlement failed for payment ${payment.id}:`, err.message);
       }
     }
+
+    // Cleanup expired pending payments
+    const expiredCount = await Payment.update(
+      { status: "expired" },
+      { 
+        where: { 
+          status: "pending", 
+          expires_at: { [Op.lte]: now } 
+        } 
+      }
+    );
+    if (expiredCount[0] > 0) {
+      console.log(`[CRON] Marked ${expiredCount[0]} expired payment intents.`);
+    }
   } catch (err) {
     console.error("Cron release task failed:", err.message);
   }
