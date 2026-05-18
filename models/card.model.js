@@ -14,7 +14,7 @@ const Card = sequelize.define(
       type: DataTypes.STRING,
       defaultValue: "pending_approval",
       validate: {
-        isIn: [["pending_approval", "active", "sold", "cancelled", "rejected", "invalid"]],
+        isIn: [["pending_approval", "active", "reserved", "sold", "cancelled", "rejected", "invalid"]],
       },
     },
     retailer_wallet_address: { type: DataTypes.STRING },

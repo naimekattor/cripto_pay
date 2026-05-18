@@ -26,6 +26,21 @@ router.get("/cards", async (_req, res) => {
   }
 });
 
+// Get Public Stats
+router.get("/stats", async (_req, res) => {
+  try {
+    const totalActive = await Card.count({
+      where: { status: "active" }
+    });
+    const totalSold = await Card.count({
+      where: { status: "sold" }
+    });
+    return res.json({ totalActive, totalSold });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 // Exchange Rates
 router.get("/exchange-rates", async (req, res) => {
   try {
@@ -115,7 +130,7 @@ router.post("/alchemy-webhook", async (req, res) => {
           asset: asset,
           [Op.or]: [{ user_address: fromAddress }, { user_address: null }],
         },
-        include: [{ model: Card, as: "card", where: { status: "active" } }],
+        include: [{ model: Card, as: "card", where: { status: ["active", "reserved"] } }],
         order: [["id", "ASC"]],
       });
 

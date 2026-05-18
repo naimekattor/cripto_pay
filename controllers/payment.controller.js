@@ -1,6 +1,7 @@
-const { Payment, Card, PlatformProfit } = require("../models");
+const { Payment, Card, PlatformProfit, User } = require("../models");
 const { transferFunds, wallet } = require("../utils/blockchain");
 const { normalizeAsset, getExchangeRates } = require("../utils/helpers");
+const { sendEmail } = require("../utils/email");
 
 const MAIN_BUSINESS_ACCOUNT = process.env.MAIN_BUSINESS_ACCOUNT || (wallet ? wallet.address : "");
 
@@ -134,6 +135,44 @@ async function settlePaymentToSeller({ paymentId }) {
   console.log(
     `[SETTLEMENT] Payment #${payment.id}: Total ${payment.amount} ETH | Seller: ${sellerPayoutAmount} ETH | Admin: ${adminProfitAmount} ETH | TX: ${payoutTxHash}`,
   );
+
+  // Mark card as sold
+  if (card) {
+    card.status = "sold";
+    await card.save();
+  }
+
+  // Send confirmation email to seller
+  try {
+    const seller = card ? await User.findByPk(card.seller_id) : null;
+    if (seller && seller.email) {
+      const cardName = card ? card.name : `Card #${payment.card_id}`;
+      const fiatSymbol = card?.currency === 'GBP' ? '£' : card?.currency === 'CAD' ? 'CA$' : '$';
+      const fiatAmt = card?.sellerReceives ? `${fiatSymbol}${card.sellerReceives.toFixed(2)} (${card.currency || 'USD'})` : 'N/A';
+      await sendEmail({
+        to: seller.email,
+        subject: `✅ Your Gift Card Has Sold – Payout Confirmed`,
+        html: `
+          <div style="font-family: system-ui, sans-serif; max-width: 560px; margin: 0 auto; padding: 32px; background: #f8fafc; border-radius: 16px;">
+            <div style="background: #0f172a; border-radius: 12px; padding: 24px 32px; margin-bottom: 24px;">
+              <h1 style="color: #ffffff; font-size: 22px; margin: 0;">🎉 Payout Confirmed</h1>
+              <p style="color: #94a3b8; margin: 8px 0 0;">Your escrow has completed successfully.</p>
+            </div>
+            <table style="width: 100%; border-collapse: collapse; background: #fff; border-radius: 12px; overflow: hidden;">
+              <tr style="border-bottom: 1px solid #e2e8f0;"><td style="padding: 14px 20px; color: #64748b; font-size: 13px;">Gift Card</td><td style="padding: 14px 20px; font-weight: 700; color: #0f172a;">${cardName}</td></tr>
+              <tr style="border-bottom: 1px solid #e2e8f0;"><td style="padding: 14px 20px; color: #64748b; font-size: 13px;">Payout (Fiat Value)</td><td style="padding: 14px 20px; font-weight: 700; color: #16a34a;">${fiatAmt}</td></tr>
+              <tr style="border-bottom: 1px solid #e2e8f0;"><td style="padding: 14px 20px; color: #64748b; font-size: 13px;">Payout (ETH Sent)</td><td style="padding: 14px 20px; font-weight: 700; color: #0f172a;">${sellerPayoutAmount.toFixed(8)} ETH</td></tr>
+              <tr style="border-bottom: 1px solid #e2e8f0;"><td style="padding: 14px 20px; color: #64748b; font-size: 13px;">Transaction Ref</td><td style="padding: 14px 20px; font-family: monospace; font-size: 11px; color: #475569; word-break: break-all;">${payoutTxHash}</td></tr>
+              <tr><td style="padding: 14px 20px; color: #64748b; font-size: 13px;">Status</td><td style="padding: 14px 20px;"><span style="background: #dcfce7; color: #15803d; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 700;">Escrow Completed</span></td></tr>
+            </table>
+            <p style="margin-top: 24px; color: #94a3b8; font-size: 12px; text-align: center;">GiftCard Crypto – Your crypto payout has been transferred to your wallet. Thank you for selling with us.</p>
+          </div>
+        `,
+      });
+    }
+  } catch (emailErr) {
+    console.error(`[EMAIL] Failed to send seller confirmation for payment #${payment.id}:`, emailErr.message);
+  }
 
   return { payment, didSettle: true, payoutTxHash };
 }

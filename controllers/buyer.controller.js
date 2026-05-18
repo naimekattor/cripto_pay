@@ -106,7 +106,7 @@ exports.buyCard = async (req, res) => {
       return res.status(403).json({ error: "Access denied" });
     const cardId = Number(req.body.card_id);
     const card = await Card.findByPk(cardId);
-    if (!card || card.status !== "active") {
+    if (!card || !['active', 'reserved'].includes(card.status)) {
       return res.status(404).json({ error: "Card is not available." });
     }
 
@@ -119,6 +119,7 @@ exports.buyCard = async (req, res) => {
         return res.status(409).json({ error: "This card is already being processed (Payment Received)." });
       }
 
+      // Same buyer resuming their own reservation — always allow
       if (existingPayment.buyer_id === req.user.id) {
         const rates = await getExchangeRates();
         const fiatCurrency = card.currency || "USD";
@@ -134,21 +135,30 @@ exports.buyCard = async (req, res) => {
           message: "Resuming existing payment flow (Rates updated).",
           payment_id: existingPayment.id,
           card_id: card.id,
-          amount: finalEthAmount,
+          eth_amount: finalEthAmount,
           pay_to: MAIN_BUSINESS_ACCOUNT,
+          expires_at: existingPayment.expires_at,
         });
       }
 
-      const fifteenMinsAgo = new Date(Date.now() - 15 * 60 * 1000);
+      // A different buyer has an active payment — check if it's expired
       const createdAt = new Date(existingPayment.created_at || Date.now());
+      const thirtyMinsAgo = new Date(Date.now() - 30 * 60 * 1000);
 
-      if (createdAt < fifteenMinsAgo) {
+      if (createdAt < thirtyMinsAgo) {
+        // Expired intent — release card back to active and destroy intent
         await existingPayment.destroy();
+        card.status = "active";
+        await card.save();
       } else {
         return res.status(409).json({
-          error: "Another buyer is currently attempting to purchase this card. Please try again in 15 minutes.",
+          error: "This card is temporarily reserved by another buyer. Please check back in 30 minutes.",
         });
       }
+    } else if (card.status === 'reserved') {
+      // Card marked reserved but no active payment found — restore it
+      card.status = "active";
+      await card.save();
     }
 
     const rates = await getExchangeRates();
@@ -163,7 +173,7 @@ exports.buyCard = async (req, res) => {
       return res.status(500).json({ error: "The server is not configured with a destination wallet for payments." });
     }
 
-    const expiresAt = new Date(Date.now() + 20 * 60 * 1000); // 20 minutes from now
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes – matches reservation window
     const intent = await Payment.create({
       amount: finalEthAmount,
       status: "pending",
@@ -176,6 +186,11 @@ exports.buyCard = async (req, res) => {
       fiat_currency: card.currency,
       expires_at: expiresAt,
     });
+
+    // Immediately reserve the card – hides it from marketplace and blocks cancellation
+    card.status = "reserved";
+    await card.save();
+    console.log(`[RESERVATION] Card #${card.id} reserved by buyer #${req.user.id} until ${expiresAt.toISOString()}`);
 
     return res.status(201).json({
       message: "Payment intent created.",

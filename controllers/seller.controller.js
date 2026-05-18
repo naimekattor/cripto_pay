@@ -79,20 +79,25 @@ exports.sellCard = async (req, res) => {
     let status = "pending_approval";
 
     if (config) {
-      // Validate digits
-      if (card_code.length !== config.digits) {
+      // Validate digits (supporting single value or array of values)
+      const digitsArray = Array.isArray(config.digits) ? config.digits : [config.digits];
+      if (!digitsArray.includes(card_code.length)) {
         isValid = false;
         validationStatus = "INVALID";
         status = "invalid";
       }
 
-      // Validate prefix
+      // Validate prefix (case-insensitive)
       if (config.startsWith.length > 0) {
-        const matchesPrefix = config.startsWith.some(prefix => card_code.startsWith(prefix));
+        const upperCode = card_code.toUpperCase();
+        const matchesPrefix = config.startsWith.some(prefix => upperCode.startsWith(prefix.toUpperCase()));
         if (!matchesPrefix) {
-          isValid = false;
-          validationStatus = "INVALID";
-          status = "invalid";
+          const isStrict = config.strictPrefix !== false;
+          if (isStrict) {
+            isValid = false;
+            validationStatus = "INVALID";
+            status = "invalid";
+          }
         }
       }
 
