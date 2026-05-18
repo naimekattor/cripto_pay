@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Box, H2, Text, Icon } from '@adminjs/design-system';
 
 const features = [
@@ -40,6 +40,30 @@ const features = [
 ];
 
 const Dashboard = () => {
+  const [stats, setStats] = useState({ totalUsers: 0, totalCards: 0, totalProfitEth: 0 });
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch('/admin/api/dashboard')
+      .then(res => res.json())
+      .then(data => {
+        if (data) {
+          setStats({
+            totalUsers: data.totalUsers || 0,
+            totalCards: data.totalCards || 0,
+            totalProfitEth: data.totalProfitEth || 0
+          });
+        }
+        setLoading(false);
+      })
+      .catch(err => {
+        console.error("Dashboard statistics load failed:", err);
+        setLoading(false);
+      });
+  }, []);
+
+  const { totalUsers, totalCards, totalProfitEth } = stats;
+
   return (
     <Box variant="grey" style={{ padding: '40px', minHeight: '100vh', backgroundColor: '#f8fafc' }}>
       <Box style={{ maxWidth: '1200px', margin: '0 auto' }}>
@@ -52,6 +76,33 @@ const Dashboard = () => {
           <Text style={{ color: '#64748b', fontSize: '16px' }}>
             Your central command center for marketplace operations.
           </Text>
+        </Box>
+
+        {/* Analytics Section */}
+        <Box style={{ 
+          display: 'grid', 
+          gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', 
+          gap: '24px',
+          marginBottom: '40px'
+        }}>
+          <Box style={{ padding: '24px', borderRadius: '16px', border: '1px solid #e2e8f0', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.05)', backgroundColor: '#ffffff' }}>
+            <Text style={{ fontSize: '12px', color: '#64748b', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '1px' }}>Total Registered Users</Text>
+            <Text style={{ fontSize: '32px', fontWeight: '800', color: '#0f172a', marginTop: '8px' }}>
+              {loading ? '...' : totalUsers}
+            </Text>
+          </Box>
+          <Box style={{ padding: '24px', borderRadius: '16px', border: '1px solid #e2e8f0', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.05)', backgroundColor: '#ffffff' }}>
+            <Text style={{ fontSize: '12px', color: '#64748b', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '1px' }}>Total Gift Cards</Text>
+            <Text style={{ fontSize: '32px', fontWeight: '800', color: '#0f172a', marginTop: '8px' }}>
+              {loading ? '...' : totalCards}
+            </Text>
+          </Box>
+          <Box style={{ padding: '24px', borderRadius: '16px', border: '1px solid #e2e8f0', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.05)', backgroundColor: '#ffffff' }}>
+            <Text style={{ fontSize: '12px', color: '#64748b', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '1px' }}>Accumulated Profit</Text>
+            <Text style={{ fontSize: '32px', fontWeight: '800', color: '#10b981', marginTop: '8px' }}>
+              {loading ? '...' : `${totalProfitEth} ETH`}
+            </Text>
+          </Box>
         </Box>
 
         {/* Grid Section */}

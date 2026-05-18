@@ -12,6 +12,8 @@ const User = sequelize.define(
       validate: { isIn: [["buyer", "seller", "admin"]] },
       defaultValue: "buyer",
     },
+    is_buyer: { type: DataTypes.BOOLEAN, defaultValue: false },
+    is_seller: { type: DataTypes.BOOLEAN, defaultValue: false },
     is_verified: { type: DataTypes.BOOLEAN, defaultValue: false },
     verification_code: { type: DataTypes.STRING, allowNull: true },
     verification_code_expires: { type: DataTypes.DATE, allowNull: true },

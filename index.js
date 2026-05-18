@@ -120,8 +120,42 @@ async function start() {
   } catch (e) {
     // Columns might already exist, ignore errors safely
   }
+  try {
+    await sequelize.query('ALTER TABLE users ADD COLUMN is_buyer BOOLEAN DEFAULT 0;');
+    await sequelize.query('ALTER TABLE users ADD COLUMN is_seller BOOLEAN DEFAULT 0;');
+  } catch (e) {
+    // Columns might already exist, ignore errors safely
+  }
+  try {
+    // Migrate existing buyer records
+    await sequelize.query("UPDATE users SET is_buyer = 1 WHERE role = 'buyer';");
+    // Migrate existing seller records
+    await sequelize.query("UPDATE users SET is_seller = 1 WHERE role = 'seller';");
+    // Migrate existing admin records to have both
+    await sequelize.query("UPDATE users SET is_buyer = 1, is_seller = 1 WHERE role = 'admin';");
+  } catch (e) {
+    console.error("Failed to migrate user roles:", e.message);
+  }
   await sequelize.sync();
   console.log("Database synced");
+
+  // Pre-populate default platform charge setting if not present
+  try {
+    const { Setting } = require("./models");
+    const [setting, created] = await Setting.findOrCreate({
+      where: { key: "PLATFORM_CHARGE_PERCENTAGE" },
+      defaults: {
+        value: "10",
+        description: "Platform commission charge percentage (e.g. 10 for 10%)"
+      }
+    });
+    if (created) {
+      console.log("Initialized default PLATFORM_CHARGE_PERCENTAGE setting to 10%");
+    }
+  } catch (err) {
+    console.error("Failed to initialize PLATFORM_CHARGE_PERCENTAGE setting:", err.message);
+  }
+
   await setupAdminPanel(app);
   app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
 }

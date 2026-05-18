@@ -55,12 +55,29 @@ async function setupAdminPanel(app) {
       },
     },
     componentLoader,
-    dashboard: { component: Components.Dashboard },
+    dashboard: { 
+      component: Components.Dashboard,
+      handler: async (request, response, context) => {
+        const totalUsers = await User.count();
+        const totalCards = await Card.count();
+        const totalPayments = await Payment.count();
+        
+        const profits = await PlatformProfit.findAll();
+        const totalProfitEth = profits.reduce((sum, p) => sum + (p.admin_profit || 0), 0);
+        
+        return {
+          totalUsers: totalUsers || 0,
+          totalCards: totalCards || 0,
+          totalPayments: totalPayments || 0,
+          totalProfitEth: Number(totalProfitEth.toFixed(6)) || 0
+        };
+      }
+    },
     resources: [
       {
         resource: User,
         options: {
-          navigation: { name: "Identity", icon: "User" },
+          navigation: { name: "Marketplace Control", icon: "Settings" },
           listProperties: ["id", "email", "role"],
           editProperties: ["email", "role", "password"],
         },
@@ -68,7 +85,11 @@ async function setupAdminPanel(app) {
       {
         resource: Card,
         options: {
-          navigation: { name: "Catalog", icon: "Product" },
+          navigation: { name: "Marketplace Control", icon: "Settings" },
+          sort: {
+            sortBy: 'id',
+            direction: 'desc',
+          },
           listProperties: ["id", "name", "price", "status", "retailer", "seller_id", "card_code", "file_path"],
           properties: {
             price: { label: "Price (ETH)" },
@@ -140,7 +161,7 @@ async function setupAdminPanel(app) {
       {
         resource: Payment,
         options: {
-          navigation: { name: "Payments", icon: "Payment" },
+          navigation: { name: "Marketplace Control", icon: "Settings" },
           listProperties: ["id", "external_id", "amount", "admin_profit", "seller_payout_amount", "asset", "status", "complaint_status", "profit_status", "card_id", "buyer_id", "release_at"],
           properties: {
             amount: { label: "Total Amount (ETH)" },
@@ -287,7 +308,7 @@ async function setupAdminPanel(app) {
       {
         resource: AuditLog,
         options: {
-          navigation: { name: "System Logs", icon: "Catalog" },
+          navigation: { name: "Marketplace Control", icon: "Settings" },
           listProperties: ["id", "admin_email", "action", "target_type", "target_id", "created_at"],
           actions: {
             new: { isVisible: false },
@@ -299,7 +320,7 @@ async function setupAdminPanel(app) {
       {
         resource: PlatformProfit,
         options: {
-          navigation: { name: "Profit Analytics", icon: "BarChart" },
+          navigation: { name: "Marketplace Control", icon: "Settings" },
           listProperties: ["id", "payment_id", "total_amount", "seller_payout", "admin_profit", "asset", "status", "locked_until", "created_at"],
           properties: {
             total_amount: { label: "Total Amount (ETH)" },
@@ -312,7 +333,7 @@ async function setupAdminPanel(app) {
       {
         resource: Setting,
         options: {
-          navigation: { name: "Platform Config", icon: "Settings" },
+          navigation: { name: "Marketplace Control", icon: "Settings" },
           listProperties: ["id", "key", "value", "description"],
           editProperties: ["value", "description"],
         },

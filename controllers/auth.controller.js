@@ -13,7 +13,28 @@ exports.register = async (req, res) => {
     }
     const existing = await User.findOne({ where: { email } });
     if (existing) {
-      return res.status(409).json({ error: "Email already in use." });
+      // Check password to see if it's the correct owner trying to add/upgrade a role
+      const match = await bcrypt.compare(password, existing.password_hash);
+      if (!match) {
+        return res.status(409).json({ error: "Email already in use." });
+      }
+
+      // Check if they already have this role
+      const hasRole = (role === "buyer" && existing.is_buyer) || (role === "seller" && existing.is_seller);
+      if (hasRole) {
+        return res.status(400).json({ error: `Account already has ${role} role.` });
+      }
+
+      // Upgrade role
+      if (role === "buyer") existing.is_buyer = true;
+      if (role === "seller") existing.is_seller = true;
+      await existing.save();
+
+      return res.status(200).json({ 
+        message: `Successfully attached ${role} role to your existing account!`, 
+        id: existing.id,
+        upgraded: true
+      });
     }
 
     const verification_code = generate4DigitCode();
@@ -24,6 +45,8 @@ exports.register = async (req, res) => {
       email,
       password_hash,
       role,
+      is_buyer: role === "buyer" || role === "admin",
+      is_seller: role === "seller" || role === "admin",
       verification_code,
       verification_code_expires,
       is_verified: false
@@ -122,10 +145,29 @@ exports.login = async (req, res) => {
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) return res.status(401).json({ error: "Invalid credentials" });
 
-    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, {
+    const roles = [];
+    if (user.is_buyer) roles.push("buyer");
+    if (user.is_seller) roles.push("seller");
+    if (user.role === "admin") roles.push("admin");
+
+    if (roles.length === 0) {
+      roles.push(user.role);
+    }
+
+    let activeRole = user.role;
+    if (!roles.includes(activeRole)) {
+      activeRole = roles[0];
+    }
+
+    const token = jwt.sign({ 
+      id: user.id, 
+      role: activeRole, 
+      roles, 
+      activeRole 
+    }, JWT_SECRET, {
       expiresIn: "24h",
     });
-    res.json({ token, role: user.role, email: user.email });
+    res.json({ token, role: activeRole, roles, activeRole, email: user.email });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -187,6 +229,85 @@ exports.resetPassword = async (req, res) => {
     await user.save();
 
     res.json({ message: "Password reset successfully. You can now log in with your new password." });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.switchRole = async (req, res) => {
+  try {
+    const { role } = req.body;
+    if (!role || (role !== "buyer" && role !== "seller" && role !== "admin")) {
+      return res.status(400).json({ error: "Invalid role selected." });
+    }
+
+    const user = await User.findByPk(req.user.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const roles = [];
+    if (user.is_buyer) roles.push("buyer");
+    if (user.is_seller) roles.push("seller");
+    if (user.role === "admin") roles.push("admin");
+
+    if (!roles.includes(role)) {
+      return res.status(403).json({ error: `You do not have access to the ${role} role.` });
+    }
+
+    user.role = role;
+    await user.save();
+
+    const token = jwt.sign({ 
+      id: user.id, 
+      role: role, 
+      roles, 
+      activeRole: role 
+    }, JWT_SECRET, { expiresIn: "24h" });
+
+    res.json({ token, roles, activeRole: role, email: user.email });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.upgradeRole = async (req, res) => {
+  try {
+    const { role } = req.body;
+    if (!role || (role !== "buyer" && role !== "seller")) {
+      return res.status(400).json({ error: "Valid role ('buyer' or 'seller') is required." });
+    }
+
+    const user = await User.findByPk(req.user.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    let updated = false;
+    if (role === "buyer" && !user.is_buyer) {
+      user.is_buyer = true;
+      updated = true;
+    } else if (role === "seller" && !user.is_seller) {
+      user.is_seller = true;
+      updated = true;
+    }
+
+    if (updated) {
+      await user.save();
+    }
+
+    const roles = [];
+    if (user.is_buyer) roles.push("buyer");
+    if (user.is_seller) roles.push("seller");
+    if (user.role === "admin") roles.push("admin");
+
+    user.role = role;
+    await user.save();
+
+    const token = jwt.sign({ 
+      id: user.id, 
+      role: role, 
+      roles, 
+      activeRole: role 
+    }, JWT_SECRET, { expiresIn: "24h" });
+
+    res.json({ token, roles, activeRole: role, email: user.email, message: `Successfully upgraded to ${role}.` });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

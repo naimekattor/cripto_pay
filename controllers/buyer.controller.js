@@ -9,7 +9,7 @@ const HOLD_HOURS = 24;
 
 exports.getPayments = async (req, res) => {
   if (req.user.role !== "buyer")
-    return res.status(403).json({ error: "Access denied" });
+    return res.status(403).json({ error: "Access denied. Please switch to Buyer Mode to view purchases." });
   try {
     const payments = await Payment.findAll({
       where: { buyer_id: req.user.id },
@@ -33,7 +33,7 @@ exports.getPayments = async (req, res) => {
 
 exports.complainPayment = async (req, res) => {
   if (req.user.role !== "buyer")
-    return res.status(403).json({ error: "Access denied" });
+    return res.status(403).json({ error: "Access denied. Please switch to Buyer Mode to file disputes." });
   try {
     const payment = await Payment.findOne({
       where: { id: req.params.id, buyer_id: req.user.id },
@@ -63,7 +63,7 @@ exports.complainPayment = async (req, res) => {
 
 exports.confirmPayment = async (req, res) => {
   if (req.user.role !== "buyer")
-    return res.status(403).json({ error: "Access denied" });
+    return res.status(403).json({ error: "Access denied. Please switch to Buyer Mode to confirm order delivery." });
   try {
     const payment = await Payment.findOne({
       where: { id: req.params.id, buyer_id: req.user.id },
@@ -102,8 +102,11 @@ exports.confirmPayment = async (req, res) => {
 
 exports.buyCard = async (req, res) => {
   try {
-    if (req.user.role !== "buyer")
-      return res.status(403).json({ error: "Access denied" });
+    if (req.user.role !== "buyer") {
+      return res.status(403).json({ 
+        error: "You do not have permission to purchase gift cards in Seller Mode. Please switch your active role to Buyer to buy gift cards." 
+      });
+    }
     const cardId = Number(req.body.card_id);
     const card = await Card.findByPk(cardId);
     if (!card || !['active', 'reserved'].includes(card.status)) {
