@@ -105,6 +105,40 @@ cron.schedule("* * * * *", async () => {
       );
       console.log(`[CRON] Marked ${expiredPayments.length} expired payment intent(s).`);
     }
+
+    // Auto-reveal logic (24 hours after purchase/created)
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const unrevealedPayments = await Payment.findAll({
+      where: {
+        status: { [Op.in]: ["holding", "completed", "disputed"] },
+        isRevealed: false,
+        autoRevealed: false,
+        [Op.or]: [
+          { purchasedAt: { [Op.lte]: twentyFourHoursAgo } },
+          { 
+            purchasedAt: null, 
+            created_at: { [Op.lte]: twentyFourHoursAgo } 
+          }
+        ]
+      }
+    });
+
+    for (const payment of unrevealedPayments) {
+      try {
+        payment.isRevealed = true;
+        payment.revealedAt = new Date();
+        payment.autoRevealed = true;
+        payment.autoRevealedAt = new Date();
+        payment.revealSource = "automatic";
+        if (!payment.purchasedAt) {
+          payment.purchasedAt = payment.created_at || new Date();
+        }
+        await payment.save();
+        console.log(`[CRON] Auto-revealed payment #${payment.id} after 24h.`);
+      } catch (err) {
+        console.error(`Auto-reveal failed for payment ${payment.id}:`, err.message);
+      }
+    }
   } catch (err) {
     console.error("Cron release task failed:", err.message);
   }
@@ -117,6 +151,16 @@ async function start() {
     await sequelize.query('ALTER TABLE payments ADD COLUMN expires_at DATETIME;');
     await sequelize.query('ALTER TABLE payments ADD COLUMN fiat_amount REAL;');
     await sequelize.query('ALTER TABLE payments ADD COLUMN fiat_currency VARCHAR(255);');
+  } catch (e) {
+    // Columns might already exist, ignore errors safely
+  }
+  try {
+    await sequelize.query('ALTER TABLE payments ADD COLUMN isRevealed BOOLEAN DEFAULT 0;');
+    await sequelize.query('ALTER TABLE payments ADD COLUMN revealedAt DATETIME;');
+    await sequelize.query('ALTER TABLE payments ADD COLUMN autoRevealed BOOLEAN DEFAULT 0;');
+    await sequelize.query('ALTER TABLE payments ADD COLUMN autoRevealedAt DATETIME;');
+    await sequelize.query('ALTER TABLE payments ADD COLUMN purchasedAt DATETIME;');
+    await sequelize.query('ALTER TABLE payments ADD COLUMN revealSource VARCHAR(255);');
   } catch (e) {
     // Columns might already exist, ignore errors safely
   }

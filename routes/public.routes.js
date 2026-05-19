@@ -154,6 +154,7 @@ router.post("/alchemy-webhook", async (req, res) => {
 
       pending.status = "holding";
       pending.release_at = computeReleaseAt();
+      pending.purchasedAt = new Date();
       await pending.save();
 
       const card = await Card.findByPk(pending.card_id);

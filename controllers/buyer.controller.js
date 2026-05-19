@@ -18,14 +18,53 @@ exports.getPayments = async (req, res) => {
     });
     const sanitized = payments.map((p) => {
       const payment = p.toJSON();
-      const eligible = ["holding", "completed"].includes(payment.status);
-      if (!eligible && payment.card) {
-        delete payment.card.card_code;
-        delete payment.card.card_pin;
+      const eligible = ["holding", "completed", "disputed"].includes(payment.status);
+      const isRevealed = payment.isRevealed || payment.autoRevealed;
+      if (payment.card) {
+        if (!eligible || !isRevealed) {
+          delete payment.card.card_code;
+          delete payment.card.card_pin;
+        }
       }
       return payment;
     });
     res.json(sanitized);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+exports.revealPayment = async (req, res) => {
+  if (req.user.role !== "buyer")
+    return res.status(403).json({ error: "Access denied. Please switch to Buyer Mode to reveal gift cards." });
+  
+  try {
+    const payment = await Payment.findOne({
+      where: { id: req.params.id, buyer_id: req.user.id },
+      include: [{ model: Card, as: "card" }]
+    });
+    
+    if (!payment) return res.status(404).json({ error: "Payment not found" });
+    if (!["holding", "completed", "disputed"].includes(payment.status)) {
+      return res.status(400).json({ error: "Cannot reveal a gift card for a payment in this status." });
+    }
+
+    if (!payment.isRevealed && !payment.autoRevealed) {
+      payment.isRevealed = true;
+      payment.revealedAt = new Date();
+      payment.revealSource = "manual";
+      if (!payment.purchasedAt) {
+        payment.purchasedAt = payment.created_at;
+      }
+      await payment.save();
+    }
+
+    // Re-fetch with card association to ensure code/pin are included in response
+    const fresh = await Payment.findOne({
+      where: { id: payment.id },
+      include: [{ model: Card, as: "card" }]
+    });
+    res.json(fresh);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

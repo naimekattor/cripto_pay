@@ -61,6 +61,12 @@ const Payment = sequelize.define(
       validate: { isIn: [["none", "holding", "released", "withdrawn"]] },
     },
     created_at: { type: DataTypes.DATE, defaultValue: Sequelize.NOW },
+    isRevealed: { type: DataTypes.BOOLEAN, defaultValue: false },
+    revealedAt: { type: DataTypes.DATE, allowNull: true },
+    autoRevealed: { type: DataTypes.BOOLEAN, defaultValue: false },
+    autoRevealedAt: { type: DataTypes.DATE, allowNull: true },
+    purchasedAt: { type: DataTypes.DATE, allowNull: true },
+    revealSource: { type: DataTypes.STRING, allowNull: true },
   },
   { tableName: "payments", timestamps: false }
 );
